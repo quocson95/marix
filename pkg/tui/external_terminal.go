@@ -63,9 +63,10 @@ func LaunchExternalTerminal(host string, port int, username, password, privateKe
 			name string
 			args []string
 		}{
-			{"gnome-terminal", []string{"--", "bash", "-c", sshCmd + "; exec bash"}},
-			{"konsole", []string{"-e", "bash", "-c", sshCmd + "; exec bash"}},
-			{"xfce4-terminal", []string{"-e", "bash -c '" + sshCmd + "; exec bash'"}},
+			{"gnome-terminal", []string{"--tab", "--", "bash", "-c", sshCmd + "; exec bash"}},
+			{"konsole", []string{"--new-tab", "-e", "bash", "-c", sshCmd + "; exec bash"}},
+			{"xfce4-terminal", []string{"--tab", "-e", "bash -c '" + sshCmd + "; exec bash'"}},
+			{"mate-terminal", []string{"--tab", "--", "bash", "-c", sshCmd + "; exec bash"}},
 			{"xterm", []string{"-e", "bash", "-c", sshCmd + "; exec bash"}},
 			{"alacritty", []string{"-e", "bash", "-c", sshCmd + "; exec bash"}},
 			{"kitty", []string{"bash", "-c", sshCmd + "; exec bash"}},
@@ -114,8 +115,11 @@ func LaunchExternalTerminal(host string, port int, username, password, privateKe
 		args = append(args, fmt.Sprintf("%s@%s", username, host))
 
 		if _, err := exec.LookPath("wt.exe"); err == nil {
-			// wt.exe [args to ssh...]
-			cmd = exec.Command("wt.exe", args...)
+			// wt.exe -w 0 nt ssh ...
+			// -w 0 targets the current window (if possible/supported context), nt = new-tab
+			wtArgs := []string{"-w", "0", "nt"}
+			wtArgs = append(wtArgs, args...)
+			cmd = exec.Command("wt.exe", wtArgs...)
 		} else {
 			// cmd /c start ssh ...
 			// args must be passed to start
