@@ -18,7 +18,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-20.04
+          - runner: ubuntu-22.04
             goos: linux
             goarch: amd64
             output_bin: marix
