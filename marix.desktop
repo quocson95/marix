@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Marix
+Comment=Secure SSH & SFTP Client
+Exec=marix
+Icon=marix
+Terminal=true
+Categories=Utility;Network;

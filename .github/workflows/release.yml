@@ -1,0 +1,136 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}-latest
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu
+            goos: linux
+            goarch: amd64
+            output_bin: marix
+            artifact_name: Marix-x86_64.AppImage
+            asset_content_type: application/vnd.appimage
+          - os: ubuntu
+            goos: linux
+            goarch: arm64
+            output_bin: marix
+            artifact_name: Marix-aarch64.AppImage
+            asset_content_type: application/vnd.appimage
+          - os: windows
+            goos: windows
+            goarch: amd64
+            output_bin: marix.exe
+            artifact_name: Marix-x86_64.exe
+            asset_content_type: application/vnd.microsoft.portable-executable
+          - os: macos
+            goos: darwin
+            goarch: amd64
+            output_bin: marix
+            artifact_name: Marix-x86_64.dmg
+            asset_content_type: application/x-apple-diskimage
+          - os: macos
+            goos: darwin
+            goarch: arm64
+            output_bin: marix
+            artifact_name: Marix-arm64.dmg
+            asset_content_type: application/x-apple-diskimage
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p build
+          go build -ldflags="-s -w" -o build/${{ matrix.output_bin }} ./cmd/marix
+
+      # --- Linux AppImage ---
+      - name: Package AppImage (Linux)
+        if: matrix.goos == 'linux'
+        run: |
+          # Install dependencies
+          sudo apt-get update && sudo apt-get install -y libfuse2
+
+          # Determine architecture for linuxdeploy
+          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+            ARCH="x86_64"
+          else
+            ARCH="aarch64"
+          fi
+
+          # Download linuxdeploy
+          wget "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$ARCH.AppImage"
+          chmod +x linuxdeploy*.AppImage
+
+          # Prepare AppDir
+          mkdir -p AppDir/usr/bin
+          cp build/marix AppDir/usr/bin/
+          cp icon.svg AppDir/marix.svg
+          cp marix.desktop AppDir/
+
+          # Generate AppImage
+          # We export OUTPUT so linuxdeploy uses it for the generated file
+          export OUTPUT="${{ matrix.artifact_name }}"
+          ./linuxdeploy-$ARCH.AppImage --appdir AppDir --output appimage --icon-file AppDir/marix.svg --desktop-file AppDir/marix.desktop --executable AppDir/usr/bin/marix
+
+          # Move to build folder for upload step
+          mv ${{ matrix.artifact_name }} build/
+
+      # --- macOS DMG ---
+      - name: Package DMG (macOS)
+        if: matrix.goos == 'darwin'
+        run: |
+          brew install create-dmg
+          
+          mkdir -p dist
+          cp build/marix dist/
+          
+          create-dmg \
+            --volname "Marix Installer" \
+            --volicon "icon.svg" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --icon "marix" 200 190 \
+            --hide-extension "marix" \
+            --app-drop-link 600 185 \
+            "build/${{ matrix.artifact_name }}" \
+            "dist/"
+
+      # --- Windows EXE ---
+      - name: Package EXE (Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          # Just rename/move implementation if needed, but build/marix.exe is already there
+          mv build/${{ matrix.output_bin }} build/${{ matrix.artifact_name }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marix-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build/${{ matrix.artifact_name }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: build/${{ matrix.artifact_name }}
