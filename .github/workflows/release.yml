@@ -18,23 +18,23 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-latest
             goos: linux
             goarch: amd64
             output_bin: marix
-            artifact_name: Marix-x86_64.AppImage
-            asset_content_type: application/vnd.appimage
+            artifact_name: marix-linux-amd64
+            asset_content_type: application/octet-stream
           - runner: windows-latest
             goos: windows
             goarch: amd64
             output_bin: marix.exe
-            artifact_name: Marix-x86_64.exe
+            artifact_name: marix-windows-amd64.exe
             asset_content_type: application/vnd.microsoft.portable-executable
           - runner: macos-latest
             goos: darwin
             goarch: amd64
             output_bin: marix
-            artifact_name: Marix-x86_64.dmg
+            artifact_name: marix-darwin-amd64.dmg
             asset_content_type: application/x-apple-diskimage
           - runner: macos-latest
             goos: darwin
@@ -60,37 +60,11 @@ jobs:
           mkdir -p build
           go build -ldflags="-s -w" -o build/${{ matrix.output_bin }} ./cmd/marix
 
-      # --- Linux AppImage ---
-      - name: Package AppImage (Linux)
+      # --- Linux Static Binary ---
+      - name: Rename Linux Binary
         if: matrix.goos == 'linux'
         run: |
-          # Install dependencies
-          sudo apt-get update && sudo apt-get install -y libfuse2
-
-          # Determine architecture for linuxdeploy
-          if [ "${{ matrix.goarch }}" = "amd64" ]; then
-            ARCH="x86_64"
-          else
-            ARCH="aarch64"
-          fi
-
-          # Download linuxdeploy
-          wget "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$ARCH.AppImage"
-          chmod +x linuxdeploy*.AppImage
-
-          # Prepare AppDir
-          mkdir -p AppDir/usr/bin
-          cp build/marix AppDir/usr/bin/
-          cp icon.svg AppDir/marix.svg
-          cp marix.desktop AppDir/
-
-          # Generate AppImage
-          # We export OUTPUT so linuxdeploy uses it for the generated file
-          export OUTPUT="${{ matrix.artifact_name }}"
-          ./linuxdeploy-$ARCH.AppImage --appdir AppDir --output appimage --icon-file AppDir/marix.svg --desktop-file AppDir/marix.desktop --executable AppDir/usr/bin/marix
-
-          # Move to build folder for upload step
-          mv ${{ matrix.artifact_name }} build/
+          mv build/${{ matrix.output_bin }} build/${{ matrix.artifact_name }}
 
       # --- macOS DMG ---
       - name: Package DMG (macOS)
