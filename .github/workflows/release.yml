@@ -8,38 +8,32 @@ on:
 jobs:
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}-latest
+    runs-on: ${{ matrix.runner }}
     defaults:
       run:
         shell: bash
     strategy:
       matrix:
         include:
-          - os: ubuntu
+          - runner: ubuntu-20.04
             goos: linux
             goarch: amd64
             output_bin: marix
             artifact_name: Marix-x86_64.AppImage
             asset_content_type: application/vnd.appimage
-          - os: ubuntu
-            goos: linux
-            goarch: arm64
-            output_bin: marix
-            artifact_name: Marix-aarch64.AppImage
-            asset_content_type: application/vnd.appimage
-          - os: windows
+          - runner: windows-latest
             goos: windows
             goarch: amd64
             output_bin: marix.exe
             artifact_name: Marix-x86_64.exe
             asset_content_type: application/vnd.microsoft.portable-executable
-          - os: macos
+          - runner: macos-latest
             goos: darwin
             goarch: amd64
             output_bin: marix
             artifact_name: Marix-x86_64.dmg
             asset_content_type: application/x-apple-diskimage
-          - os: macos
+          - runner: macos-latest
             goos: darwin
             goarch: arm64
             output_bin: marix
