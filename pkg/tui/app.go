@@ -285,6 +285,11 @@ func (m AppModel) updateSFTP(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.String() == "esc" {
+			// If SFTP model is filtering/searching, let it handle Esc
+			if m.sftpModel.IsSearchActive() {
+				break // Pass to m.sftpModel.Update
+			}
+
 			// If we have an active terminal session, return to it
 			if m.termModel != nil {
 				m.state = StateTerminal
@@ -316,7 +321,7 @@ func (m *AppModel) updateTerminal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+f":
 			// Open SFTP browser
 			if m.termModel != nil && m.termModel.client != nil {
-				sftpModel, err := NewSFTPDualModel(m.termModel.client)
+				sftpModel, err := NewSFTPDualModel(m.termModel.client, m.settingsStore)
 				if err == nil {
 					m.sftpModel = sftpModel
 					m.state = StateSFTP
@@ -483,7 +488,7 @@ func (m *AppModel) connectToSFTPWithPassword(server *storage.Server, keyPassword
 		}
 
 		// Create SFTP model
-		sftpModel, err := NewSFTPDualModel(sshClient)
+		sftpModel, err := NewSFTPDualModel(sshClient, m.settingsStore)
 		if err != nil {
 			log.Printf("SFTP initialization failed for %s: %v\n", server.Name, err)
 			sshClient.Close()

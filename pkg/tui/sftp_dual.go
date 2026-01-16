@@ -1,30 +1,19 @@
 package tui
 
 import (
-	"bufio"
-	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
-	"path"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/quocson95/marix/pkg/sftp"
 	"github.com/quocson95/marix/pkg/ssh"
+	"github.com/quocson95/marix/pkg/storage"
 )
-
-// Large file threshold (10MB)
-const MaxEditSize = 10 * 1024 * 1024
 
 // PaneType represents which pane is active
 type PaneType int
@@ -34,20 +23,31 @@ const (
 	RemotePane
 )
 
-// SFTPDualModel manages dual-pane SFTP file browser
+// LocalFileInfo represents local file information
+type LocalFileInfo struct {
+	Name  string
+	Size  int64
+	IsDir bool
+}
+
+// SFTPDualModel is the model for dual-pane SFTP browser
 type SFTPDualModel struct {
 	sshClient  *ssh.Client
 	sftpClient *sftp.Client
+	store      *storage.SettingsStore
 
 	// Local pane
-	localPath   string
-	localFiles  []LocalFileInfo
-	localCursor int
+	// Local pane
+	localPath         string
+	localFiles        []LocalFileInfo
+	localCursor       int
+	displayLocalFiles []LocalFileInfo // Display/Filtered files (for search)
 
 	// Remote pane
-	remotePath   string
-	remoteFiles  []sftp.FileInfo
-	remoteCursor int
+	remotePath         string
+	remoteFiles        []sftp.FileInfo
+	remoteCursor       int
+	displayRemoteFiles []sftp.FileInfo // Display/Filtered files (for search)
 
 	// UI state
 	activePane PaneType
@@ -60,100 +60,28 @@ type SFTPDualModel struct {
 	creatingFolder bool
 	input          textinput.Model
 
+	// Search state
+	searching   bool
+	searchInput textinput.Model
+
 	// Confirmation state
 	confirmingDownload bool
 	confirmingDelete   bool
 	pendingFile        *sftp.FileInfo
 
-	// Transfer Queue
-	transferQueue  *TransferQueue
-	transferUpdate chan TransferStatusMsg
-
-	// Cancellation
-	mu sync.Mutex
-	// ctx    context.Context
-	// cancel context.CancelFunc
-	ctxMap    map[int]context.Context
-	cancelMap map[int]context.CancelFunc
-	serial    int
-
-	// Debug: rsync output display
-	rsyncOutputLines []string // Last 10 lines of rsync output
+	// Task Queue (new system)
+	taskQueue    *sftp.TaskQueue
+	taskUpdate   chan sftp.TaskProgress
+	currentTasks []sftp.TaskProgress // Track active task progress
+	logHistory   []string            // Last 10 lines of output
 
 	// Refresh status
 	refreshStatus     string
-	refreshStatusTime time.Time
-}
-
-// TransferType distinguishes between upload and download
-type TransferType int
-
-const (
-	TransferUpload TransferType = iota
-	TransferDownload
-)
-
-// TransferJob represents a single file transfer operation
-type TransferJob struct {
-	Type        TransferType
-	SourcePath  string
-	DestPath    string
-	FileName    string
-	Size        int64
-	Serial      int
-	IsDirectory bool // true if transferring entire directory with rsync
-}
-
-// TransferStatusMsg updates the UI about queue progress
-type TransferStatusMsg struct {
-	Total     int
-	Pending   int
-	Active    int
-	Completed int
-	Failed    int
-	Last      string // Name of last completed file
-	Err       error
-	BytesSec  float64 // Speed in bytes/sec
-}
-
-// TransferQueue manages concurrent transfers
-type TransferQueue struct {
-	jobs      chan TransferJob
-	results   chan TransferStatusMsg
-	total     int
-	pending   int
-	active    int
-	completed int
-	failed    int
-	maxActive int
-
-	// Speed calculation
-	bytesTransferred int64
-	lastMeasured     int64 // timestamp
-	currentSpeed     float64
-	currentPercent   int       // Current progress percentage for directory transfers
-	mu               chan bool // rudimentary mutex via channel
-}
-
-// NewTransferQueue creates a new transfer queue
-func NewTransferQueue(updateChan chan TransferStatusMsg) *TransferQueue {
-	return &TransferQueue{
-		jobs:      make(chan TransferJob, 1000), // Buffer for many files
-		results:   updateChan,
-		maxActive: 5,
-		mu:        make(chan bool, 1),
-	}
-}
-
-// LocalFileInfo represents local file information
-type LocalFileInfo struct {
-	Name  string
-	Size  int64
-	IsDir bool
+	refreshStatusTime int64
 }
 
 // NewSFTPDualModel creates a new dual-pane SFTP model
-func NewSFTPDualModel(sshClient *ssh.Client) (*SFTPDualModel, error) {
+func NewSFTPDualModel(sshClient *ssh.Client, store *storage.SettingsStore) (*SFTPDualModel, error) {
 	sftpClient, err := sftp.NewClient(sshClient.GetRawClient())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SFTP client: %w", err)
@@ -170,8 +98,15 @@ func NewSFTPDualModel(sshClient *ssh.Client) (*SFTPDualModel, error) {
 		localWd = os.Getenv("HOME")
 	}
 
-	updateChan := make(chan TransferStatusMsg)
-	queue := NewTransferQueue(updateChan)
+	// Create task update channel
+	taskUpdateChan := make(chan sftp.TaskProgress, 10)
+
+	// Get SSH config for engine creation
+	sshConfig := sshClient.GetConfig()
+	settings := store.Get()
+
+	// Create task queue with max 5 concurrent tasks
+	taskQueue := sftp.NewTaskQueue(sftpClient, sshConfig, &settings, 5, taskUpdateChan)
 
 	// Initialize input
 	ti := textinput.New()
@@ -179,35 +114,28 @@ func NewSFTPDualModel(sshClient *ssh.Client) (*SFTPDualModel, error) {
 	ti.CharLimit = 156
 	ti.Width = 40
 
-	//
+	// Initialize search input
+	si := textinput.New()
+	si.Placeholder = "Search..."
+	si.CharLimit = 50
+	si.Width = 30
 
 	m := &SFTPDualModel{
 		sshClient:      sshClient,
 		sftpClient:     sftpClient,
+		store:          store,
 		localPath:      localWd,
 		remotePath:     remoteWd,
 		activePane:     LocalPane,
-		transferQueue:  queue,
-		transferUpdate: updateChan,
+		taskQueue:      taskQueue,
+		taskUpdate:     taskUpdateChan,
+		currentTasks:   make([]sftp.TaskProgress, 0),
+		logHistory:     make([]string, 0, 10),
 		input:          ti,
 		creatingFolder: false,
-		// ctx:            ctx,
-		// cancel:         cancel,
-		serial:    0,
-		ctxMap:    make(map[int]context.Context),
-		cancelMap: make(map[int]context.CancelFunc),
+		searchInput:    si,
+		searching:      false,
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.ctxMap[m.serial] = ctx
-	m.cancelMap[m.serial] = cancel
-
-	// Start worker pool
-	for i := 0; i < queue.maxActive; i++ {
-		go m.transferWorker()
-	}
-
-	// Start speed ticker
-	go m.speedTicker()
 
 	// Load initial directories
 	m.loadLocalDirectory()
@@ -215,14 +143,12 @@ func NewSFTPDualModel(sshClient *ssh.Client) (*SFTPDualModel, error) {
 
 	// If remote load failed, try fallbacks
 	if m.err != nil {
-		// Try current directory "."
 		m.err = nil
 		m.remotePath = "."
 		m.loadRemoteDirectory()
 	}
 
 	if m.err != nil {
-		// Try root "/"
 		m.err = nil
 		m.remotePath = "/"
 		m.loadRemoteDirectory()
@@ -231,24 +157,12 @@ func NewSFTPDualModel(sshClient *ssh.Client) (*SFTPDualModel, error) {
 	return m, nil
 }
 
-func (m *SFTPDualModel) speedTicker() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	var lastBytes int64
-	for range ticker.C {
-		m.transferQueue.mu <- true
-		current := m.transferQueue.bytesTransferred
-		diff := current - lastBytes
-		lastBytes = current
-		<-m.transferQueue.mu
-
-		if diff > 0 || m.transferQueue.active > 0 {
-			m.transferUpdate <- TransferStatusMsg{
-				Active:   m.transferQueue.active,
-				BytesSec: float64(diff),
-			}
-		}
+// addLog adds a message to the log history, keeping only last 10 lines
+func (m *SFTPDualModel) addLog(msg string) {
+	m.logHistory = append(m.logHistory, msg)
+	maxLog := 5
+	if len(m.logHistory) > maxLog {
+		m.logHistory = m.logHistory[len(m.logHistory)-maxLog:]
 	}
 }
 
@@ -289,6 +203,17 @@ func (m *SFTPDualModel) loadLocalDirectory() {
 	if m.localCursor < 0 {
 		m.localCursor = 0
 	}
+
+	// Reset display files
+	m.displayLocalFiles = m.localFiles
+	// If searching, re-apply filter? For now, clear search on reload or keep it?
+	// Let's clear search on reload to be simple, OR re-filter.
+	// User might want to refresh and keep filter.
+	// To keep it simple: if searching, re-filter.
+	if m.searching {
+		m.updateFilter() // We need to implement this
+	}
+
 	m.err = nil
 }
 
@@ -315,463 +240,23 @@ func (m *SFTPDualModel) loadRemoteDirectory() {
 	if m.remoteCursor < 0 {
 		m.remoteCursor = 0
 	}
+
+	// Reset display files
+	m.displayRemoteFiles = m.remoteFiles
+	if m.searching {
+		m.updateFilter()
+	}
+
 	m.err = nil
 }
 
-func (m *SFTPDualModel) cancelAllTransfers() {
-	m.mu.Lock()
-	// if m.cancel != nil {
-	// 	m.cancel()
-	// }
-	oldSerial := m.serial
-	defer func() {
-		delete(m.cancelMap, oldSerial)
-		delete(m.ctxMap, oldSerial)
-	}()
-	m.serial++
-	ctx, cancel := context.WithCancel(context.Background())
-	m.ctxMap[m.serial] = ctx
-	m.cancelMap[m.serial] = cancel
-	defer m.mu.Unlock()
-	if cancel, ok := m.cancelMap[oldSerial]; ok {
-		cancel()
-	}
-
-	// Drain pending jobs and mark as cancelled
-	cancelledCount := 0
-Loop:
-	for {
-		select {
-		case <-m.transferQueue.jobs:
-			m.transferQueue.pending--
-			cancelledCount++
-		default:
-			break Loop
-		}
-	}
-
-	// Update failed counter for cancelled jobs
-	if cancelledCount > 0 {
-		m.transferQueue.failed += cancelledCount
-		m.notifyTransferUpdate(fmt.Errorf("cancelled %d pending transfers", cancelledCount), "")
-	}
-
-	// Clear rsync output when cancelling
-	m.rsyncOutputLines = nil
-
-	// Reset active counter (running transfers will fail with context.Canceled)
-	m.transferQueue.active = 0
-}
-
-func (m *SFTPDualModel) transferWorker() {
-	for job := range m.transferQueue.jobs {
-		// drop if serial is not match
-		if job.Serial != m.serial {
-			continue
-		}
-		// Signal job started (active)
-		m.transferQueue.active++
-		m.transferQueue.pending--
-		m.notifyTransferUpdate(nil, "")
-
-		// Get current context
-		ctx := m.ctxMap[m.serial]
-
-		var err error
-
-		// Handle directory transfers with rsync directly
-		if job.IsDirectory {
-			// Check for rsync availability
-			if _, pathErr := exec.LookPath("rsync"); pathErr == nil {
-				err = m.rsyncTransferDir(job, ctx)
-			} else {
-				log.Printf("Rsync not available for directory transfer: %s", job.FileName)
-				err = fmt.Errorf("rsync not available")
-			}
-		} else {
-			// Define progress callback for file transfers
-			progress := func(bytes int64) error {
-				// Check for cancellation
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				default:
-				}
-
-				// Update queue stats securely
-				m.transferQueue.mu <- true
-				m.transferQueue.bytesTransferred += bytes
-				<-m.transferQueue.mu
-				return nil
-			}
-
-			// Check for rsync availability
-			useRsync := false
-			if _, pathErr := exec.LookPath("rsync"); pathErr == nil {
-				useRsync = true
-			}
-
-			// Check if already cancelled before starting
-			if ctx.Err() != nil {
-				err = ctx.Err()
-			} else if useRsync {
-				err = m.rsyncTransfer(job, ctx, progress)
-			} else {
-				if job.Type == TransferUpload {
-					err = m.sftpClient.Upload(job.SourcePath, job.DestPath, progress)
-				} else {
-					err = m.sftpClient.Download(job.SourcePath, job.DestPath, progress)
-				}
-			}
-		}
-
-		m.transferQueue.active--
-		if err != nil {
-			if err == context.Canceled {
-				// Don't log as error, just status
-				m.notifyTransferUpdate(nil, "")
-			} else {
-				log.Printf("Transfer failed for %s: %v", job.FileName, err)
-				m.transferQueue.failed++
-				m.notifyTransferUpdate(err, "")
-			}
-		} else {
-			m.transferQueue.completed++
-			m.notifyTransferUpdate(nil, job.FileName)
-
-			// Refresh directory listings after directory transfer completes
-			if job.IsDirectory {
-				m.loadLocalDirectory()
-				m.loadRemoteDirectory()
-
-				// Clear rsync output after directory transfer completes
-				m.mu.Lock()
-				m.rsyncOutputLines = nil
-				m.mu.Unlock()
-			}
-		}
-	}
-}
-
-func (m *SFTPDualModel) rsyncTransfer(job TransferJob, ctx context.Context, progress func(int64) error) error {
-	config := m.sshClient.GetConfig()
-
-	// Handle key
-	keyPath := config.PrivateKey
-	if len(config.KeyContent) > 0 {
-		// Write temp file
-		tmpFile, err := os.CreateTemp("", "marix-rsync-*.pem")
-		if err != nil {
-			return fmt.Errorf("temp key creation failed: %w", err)
-		}
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
-
-		// Set secure permissions (user-only read/write)
-		if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
-			return fmt.Errorf("failed to set temp key permissions: %w", err)
-		}
-
-		if _, err := tmpFile.Write(config.KeyContent); err != nil {
-			return fmt.Errorf("temp key write failed: %w", err)
-		}
-		tmpFile.Close()
-		keyPath = tmpFile.Name()
-	}
-
-	// Build Rsync Command
-	// rsync -avz -e "ssh -p PORT -i KEY -o StrictHostKeyChecking=no" SRC DEST
-
-	sshOpts := fmt.Sprintf("ssh -p %d -i '%s' -o StrictHostKeyChecking=no", config.Port, keyPath)
-	if runtime.GOOS == "windows" {
-		// Windows paths for rsync (assuming Git Bash/Cygwin style) can be tricky.
-		// escape path backslashes?
-		keyPath = filepath.ToSlash(keyPath)
-		sshOpts = fmt.Sprintf("ssh -p %d -i \"%s\" -o StrictHostKeyChecking=no", config.Port, keyPath)
-	}
-
-	var source, dest string
-	if job.Type == TransferUpload {
-		// Local -> Remote
-		source = job.SourcePath
-		dest = fmt.Sprintf("%s@%s:%s", config.Username, config.Host, job.DestPath)
-	} else {
-		// Remote -> Local
-		source = fmt.Sprintf("%s@%s:%s", config.Username, config.Host, job.SourcePath)
-		dest = job.DestPath
-	}
-
-	if runtime.GOOS == "windows" {
-		// Convert local paths for rsync (heuristic)
-		if job.Type == TransferUpload {
-			source = filepath.ToSlash(source)
-		} else {
-			dest = filepath.ToSlash(dest)
-		}
-	}
-
-	// Use CommandContext to support cancellation
-	cmd := exec.CommandContext(ctx, "rsync", "-az", "--info=progress2", "-e", sshOpts, source, dest)
-
-	// Capture output?
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Check if it was cancelled
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		log.Printf("Rsync error: %v\nOutput: %s", err, string(output))
-		return fmt.Errorf("rsync failed: %s, output: %s", err, string(output))
-	}
-
-	// Update progress (full completion)
-	// For rsync, we don't get granular progress easily without parsing stdout.
-	// Just mark complete at end.
-	progress(job.Size)
-	return nil
-}
-
-func scanLinesAndCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	for i, b := range data {
-		if b == '\n' || b == '\r' {
-			return i + 1, data[0:i], nil
-		}
-	}
-	if atEOF {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
-}
-
-// rsyncTransferDir handles directory transfer using rsync
-func (m *SFTPDualModel) rsyncTransferDir(job TransferJob, ctx context.Context) error {
-	config := m.sshClient.GetConfig()
-
-	// Handle key
-	keyPath := config.PrivateKey
-	if len(config.KeyContent) > 0 {
-		tmpFile, err := os.CreateTemp("", "marix-rsync-*.pem")
-		if err != nil {
-			return fmt.Errorf("temp key creation failed: %w", err)
-		}
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
-
-		// Set secure permissions (user-only read/write)
-		if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
-			return fmt.Errorf("failed to set temp key permissions: %w", err)
-		}
-
-		if _, err := tmpFile.Write(config.KeyContent); err != nil {
-			return fmt.Errorf("temp key write failed: %w", err)
-		}
-		tmpFile.Close()
-		keyPath = tmpFile.Name()
-	}
-
-	// Build SSH options
-	sshOpts := fmt.Sprintf("ssh -p %d -i '%s' -o StrictHostKeyChecking=no", config.Port, keyPath)
-	if runtime.GOOS == "windows" {
-		keyPath = filepath.ToSlash(keyPath)
-		sshOpts = fmt.Sprintf("ssh -p %d -i \"%s\" -o StrictHostKeyChecking=no", config.Port, keyPath)
-	}
-
-	var source, dest string
-	sourcePath := job.SourcePath
-	destPath := job.DestPath
-
-	if job.Type == TransferUpload {
-		// Ensure local path ends with separator for directory sync
-		if !strings.HasSuffix(sourcePath, "/") && !strings.HasSuffix(sourcePath, "\\") {
-			sourcePath += string(filepath.Separator)
-		}
-		source = sourcePath
-		dest = fmt.Sprintf("%s@%s:%s", config.Username, config.Host, destPath)
-		if runtime.GOOS == "windows" {
-			source = filepath.ToSlash(source)
-		}
-	} else {
-		// Download: Ensure remote path ends with /
-		if !strings.HasSuffix(sourcePath, "/") {
-			sourcePath += "/"
-		}
-		source = fmt.Sprintf("%s@%s:%s", config.Username, config.Host, sourcePath)
-		dest = destPath
-		if runtime.GOOS == "windows" {
-			dest = filepath.ToSlash(dest)
-		}
-		// Create local directory
-		os.MkdirAll(dest, 0755)
-	}
-
-	// Use CommandContext to support cancellation
-	cmd := exec.CommandContext(ctx, "rsync", "-avz", "--info=progress2", "-e", sshOpts, source, dest)
-
-	// Create pipes to capture output
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-
-	log.Printf("Running rsync directory transfer: %s -> %s", source, dest)
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start rsync: %w", err)
-	}
-
-	// Read and parse progress output in real-time
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		scanner.Split(scanLinesAndCR)
-		lastUpdate := time.Now()
-
-		for scanner.Scan() {
-			line := scanner.Text()
-
-			// Store last 10 lines for display
-			m.mu.Lock()
-			m.rsyncOutputLines = append(m.rsyncOutputLines, line)
-			if len(m.rsyncOutputLines) > 10 {
-				m.rsyncOutputLines = m.rsyncOutputLines[len(m.rsyncOutputLines)-10:]
-			}
-			m.mu.Unlock()
-
-			if strings.Contains(line, "/s") {
-				fields := strings.Fields(line)
-				var speed float64
-				var percentVal int
-
-				for _, field := range fields {
-					// Parse speed (e.g., "69.68MB/s")
-					if strings.HasSuffix(field, "/s") {
-						speedStr := strings.TrimSuffix(field, "/s")
-						if s := parseRsyncSpeed(speedStr); s > 0 {
-							speed = s
-						}
-					}
-
-					// Parse byte percentage (e.g., "49%") for large file transfers
-					if strings.HasSuffix(field, "%") {
-						percentStr := strings.TrimSuffix(field, "%")
-						if p, err := strconv.Atoi(percentStr); err == nil && p > 0 {
-							percentVal = p
-						}
-					}
-
-					// Parse file counter from ir-chk=remaining/total
-					// ir-chk=1625/1649 means 1649-1625=24 files done out of 1649 total
-					if strings.HasPrefix(field, "ir-chk=") {
-						parts := strings.TrimPrefix(field, "ir-chk=")
-						parts = strings.TrimSuffix(parts, ")")
-						counts := strings.Split(parts, "/")
-						if len(counts) == 2 {
-							if remaining, err := strconv.Atoi(counts[0]); err == nil {
-								if total, err := strconv.Atoi(counts[1]); err == nil {
-									if total > 0 {
-										filesCompleted := total - remaining
-										percentVal = (filesCompleted * 100) / total
-									}
-								}
-							}
-						}
-					}
-				}
-
-				// Throttle updates - only update every 100ms to avoid UI spam
-				now := time.Now()
-				if speed > 0 && now.Sub(lastUpdate) >= 100*time.Millisecond {
-					lastUpdate = now
-
-					m.transferQueue.mu <- true
-					m.transferQueue.currentSpeed = speed
-					if percentVal > 0 {
-						m.transferQueue.currentPercent = percentVal
-					}
-					<-m.transferQueue.mu
-
-					// Send status update
-					m.notifyTransferUpdate(nil, "")
-				}
-			}
-		}
-	}()
-
-	// Capture stderr for error messages
-	stderrBytes, _ := io.ReadAll(stderr)
-
-	// Wait for command to complete
-	err = cmd.Wait()
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		log.Printf("Rsync directory error: %v\nStderr: %s", err, string(stderrBytes))
-		return fmt.Errorf("rsync failed: %v", err)
-	}
-
-	return nil
-}
-
-// parseRsyncSpeed converts rsync speed string (e.g., "123.45MB", "1.23GB") to bytes/sec
-func parseRsyncSpeed(speedStr string) float64 {
-	speedStr = strings.TrimSpace(speedStr)
-	var multiplier float64 = 1
-
-	// Remove unit suffix and determine multiplier
-	if strings.HasSuffix(speedStr, "GB") {
-		multiplier = 1024 * 1024 * 1024
-		speedStr = strings.TrimSuffix(speedStr, "GB")
-	} else if strings.HasSuffix(speedStr, "MB") {
-		multiplier = 1024 * 1024
-		speedStr = strings.TrimSuffix(speedStr, "MB")
-	} else if strings.HasSuffix(speedStr, "KB") {
-		multiplier = 1024
-		speedStr = strings.TrimSuffix(speedStr, "KB")
-	} else if strings.HasSuffix(speedStr, "kB") {
-		multiplier = 1000
-		speedStr = strings.TrimSuffix(speedStr, "kB")
-	} else if strings.HasSuffix(speedStr, "B") {
-		multiplier = 1
-		speedStr = strings.TrimSuffix(speedStr, "B")
-	}
-
-	// Parse the numeric part
-	speed, err := strconv.ParseFloat(strings.ReplaceAll(speedStr, ",", ""), 64)
-	if err != nil {
-		return 0
-	}
-
-	return speed * multiplier
-}
-
-func (m *SFTPDualModel) notifyTransferUpdate(err error, file string) {
-	// Calculate rudimentary speed
-	// In a real implementation we'd use time-windowed average
-	m.transferUpdate <- TransferStatusMsg{
-		Total:     m.transferQueue.total,
-		Pending:   m.transferQueue.pending,
-		Active:    m.transferQueue.active,
-		Completed: m.transferQueue.completed,
-		Failed:    m.transferQueue.failed,
-		Last:      file,
-		Err:       err,
-	}
-}
-
-// waitForTransferUpdate is a command that waits for updates from workers
-func (m *SFTPDualModel) waitForTransferUpdate() tea.Msg {
-	return <-m.transferUpdate
+// waitForTaskUpdate waits for task progress updates
+func (m *SFTPDualModel) waitForTaskUpdate() tea.Msg {
+	return <-m.taskUpdate
 }
 
 func (m *SFTPDualModel) Init() tea.Cmd {
-	return m.waitForTransferUpdate
+	return m.waitForTaskUpdate
 }
 
 func (m *SFTPDualModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -781,31 +266,170 @@ func (m *SFTPDualModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 
-	case tea.KeyMsg:
-		// Handle confirmation dialog (download or delete)
-		if m.confirmingDownload {
-			switch msg.String() {
-			case "y", "Y":
-				// Confirm download
-				m.confirmingDownload = false
-				file := m.pendingFile
-				remotePath := path.Join(m.remotePath, file.Name)
-				localPath := filepath.Join(m.localPath, file.Name)
+	case sftp.TaskProgress:
+		// Update task progress in our list
+		found := false
+		for i, task := range m.currentTasks {
+			if task.TaskID == msg.TaskID {
+				m.currentTasks[i] = msg
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.currentTasks = append(m.currentTasks, msg)
+		}
 
-				// Queue download
-				return m, func() tea.Msg {
-					m.queueJob(TransferJob{
-						Type:       TransferDownload,
-						SourcePath: remotePath,
-						DestPath:   localPath,
-						FileName:   file.Name,
-						Size:       file.Size,
-						Serial:     m.serial,
-					})
-					return nil
+		// Capture log from progress update
+		if msg.LastLog != "" {
+			m.addLog(fmt.Sprintf("[%d] %s", msg.TaskID, msg.LastLog))
+		}
+
+		// Clean up completed/failed/cancelled tasks
+		var activeTasks []sftp.TaskProgress
+		for _, task := range m.currentTasks {
+			switch task.State {
+			case sftp.TaskPending, sftp.TaskScanning, sftp.TaskTransferring:
+				activeTasks = append(activeTasks, task)
+			case sftp.TaskCompleted:
+				// Refresh directories on completion
+				m.addLog(fmt.Sprintf("[%d] Task completed", task.TaskID))
+				m.loadLocalDirectory()
+				m.loadRemoteDirectory()
+			case sftp.TaskFailed:
+				errMsg := "Unknown error"
+				if msg.Error != "" {
+					errMsg = msg.Error
 				}
-			case "n", "N", "esc":
-				// Cancel
+				m.addLog(fmt.Sprintf("[%d] Task failed: %s", task.TaskID, errMsg))
+			case sftp.TaskCancelled:
+				m.addLog(fmt.Sprintf("[%d] Task cancelled", task.TaskID))
+			}
+		}
+		m.currentTasks = activeTasks
+
+		return m, m.waitForTaskUpdate
+
+	case tea.KeyMsg:
+		// Handle folder creation input
+		if m.creatingFolder {
+			switch strings.ToLower(msg.String()) {
+			case "enter":
+				name := m.input.Value()
+				if name != "" {
+					m.createFolder(name)
+				}
+				m.creatingFolder = false
+				m.input.SetValue("")
+				return m, nil
+			case "esc":
+				m.creatingFolder = false
+				m.input.SetValue("")
+				return m, nil
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return m, cmd
+			}
+		}
+
+		// Handle search input
+		if m.searching {
+			switch msg.String() {
+			case "enter":
+				// Confirm selection (stay in search view or exit?)
+				// Let's exit search mode but keep filter (so user can navigate)
+				// Or better: Enter on search usually essentially "filters" the view.
+				// User can then use Up/Down to navigate.
+				// But we are capturing keys here.
+				// If we want to navigate while searching, we need to handle Up/Down here too?
+				// Common pattern: Search box is focused, 'Enter' -> Done searching, focus list (filtered).
+				// 'Esc' -> Cancel search (unfilter).
+
+				// Let's say Enter -> Focus List (keep filter)
+				// But wait, if we focus list, `m.searching` becomes false?
+				// We need a specific "Filtered" state vs "Searching" (typing) state?
+				// Simplest: 'Enter' -> Navigate to current top match?
+
+				// Re-reading request: "f for search pannel dir".
+				// Let's implement: Type search -> Filter updates live.
+				// Press 'Enter' -> Stop typing, focus list (keep filter).
+				// Press 'Esc' -> Stop typing, Clear filter.
+
+				m.searching = false
+				// m.input.Blur() ? Bubbletea textinput has Focus/Blur.
+				m.searchInput.Blur()
+				return m, nil
+
+			case "esc":
+				m.searching = false
+				m.searchInput.SetValue("")
+				m.searchInput.Blur()
+				m.updateFilter() // Clears filter
+				return m, nil
+
+			// Allow navigation while searching?
+			case "down":
+				// Hack: Allow down/up to move cursor in background list?
+				if m.activePane == LocalPane {
+					if m.localCursor < len(m.displayLocalFiles)-1 {
+						m.localCursor++
+					}
+				} else {
+					if m.remoteCursor < len(m.displayRemoteFiles)-1 {
+						m.remoteCursor++
+					}
+				}
+				return m, nil
+			case "up":
+				if m.activePane == LocalPane {
+					if m.localCursor > 0 {
+						m.localCursor--
+					}
+				} else {
+					if m.remoteCursor > 0 {
+						m.remoteCursor--
+					}
+				}
+				return m, nil
+
+			default:
+				var cmd tea.Cmd
+				m.searchInput, cmd = m.searchInput.Update(msg)
+				m.updateFilter() // Update filter live
+				return m, cmd
+			}
+		}
+
+		// Handle confirmation dialogs
+		if m.confirmingDownload {
+			switch strings.ToLower(msg.String()) {
+			case "y":
+				m.confirmingDownload = false
+				if m.pendingFile != nil {
+					// Queue download for the pending file
+					remotePath := filepath.Join(m.remotePath, m.pendingFile.Name)
+					localPath := filepath.Join(m.localPath, m.pendingFile.Name)
+
+					taskType := sftp.TaskDownloadFile
+					if m.pendingFile.IsDir {
+						taskType = sftp.TaskDownloadDirectory
+					}
+
+					_, err := m.taskQueue.QueueTask(taskType, remotePath, localPath, m.pendingFile.Name)
+					if err != nil {
+						m.statusMsg = fmt.Sprintf("Download failed: %v", err)
+						m.addLog(fmt.Sprintf("ERROR: %v", err))
+					} else {
+						m.statusMsg = fmt.Sprintf("Downloading: %s", m.pendingFile.Name)
+						shortRemote := shortenPath(remotePath, m.remotePath)
+						shortLocal := shortenPath(localPath, m.localPath)
+						m.addLog(fmt.Sprintf("Download: %s → %s", shortRemote, shortLocal))
+					}
+				}
+				m.pendingFile = nil
+				return m, nil
+			case "n", "esc":
 				m.confirmingDownload = false
 				m.pendingFile = nil
 				return m, nil
@@ -814,55 +438,27 @@ func (m *SFTPDualModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.confirmingDelete {
-			switch msg.String() {
-			case "y", "Y":
+			switch strings.ToLower(msg.String()) {
+			case "y":
 				m.confirmingDelete = false
-				return m, m.deletePendingItem()
-			case "n", "N", "esc":
+				m.deleteSelected()
+				return m, nil
+			case "n", "esc":
 				m.confirmingDelete = false
-				m.pendingFile = nil
 				return m, nil
 			}
 			return m, nil
 		}
 
-		// Handle input if creating folder
-		if m.creatingFolder {
-			switch msg.String() {
-			case "enter":
-				name := m.input.Value()
-				if name != "" {
-					return m, m.createFolder(name)
-				}
-				m.creatingFolder = false
-				m.input.Blur()
-				return m, nil
-			case "esc":
-				m.creatingFolder = false
-				m.input.Blur()
-				m.input.Reset()
-				return m, nil
-			}
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			return m, cmd
-		}
-
-		switch msg.String() {
+		// Navigation and actions
+		switch strings.ToLower(msg.String()) {
 		case "tab":
-			// Switch active pane
 			if m.activePane == LocalPane {
 				m.activePane = RemotePane
 			} else {
 				m.activePane = LocalPane
 			}
-
-		case "n":
-			// Start folder creation
-			m.creatingFolder = true
-			m.input.Reset()
-			m.input.Focus()
-			return m, textinput.Blink
+			return m, nil
 
 		case "up", "k":
 			if m.activePane == LocalPane {
@@ -874,774 +470,710 @@ func (m *SFTPDualModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.remoteCursor--
 				}
 			}
+			return m, nil
 
 		case "down", "j":
 			if m.activePane == LocalPane {
-				if m.localCursor < len(m.localFiles)-1 {
+				if m.localCursor < len(m.displayLocalFiles)-1 {
 					m.localCursor++
 				}
 			} else {
-				if m.remoteCursor < len(m.remoteFiles)-1 {
+				if m.remoteCursor < len(m.displayRemoteFiles)-1 {
 					m.remoteCursor++
 				}
 			}
+			return m, nil
 
 		case "enter":
-			// Navigate into directory or transfer file
+			m.navigate()
+			return m, nil
+
+		case "backspace":
+			// Go to parent directory
 			if m.activePane == LocalPane {
-				return m, m.handleLocalEnter()
-			} else {
-				return m, m.handleRemoteEnter()
-			}
-
-		case "d":
-			// Download: remote to local
-			if m.activePane == RemotePane && len(m.remoteFiles) > 0 {
-				ctx := m.ctxMap[m.serial]
-				return m, m.downloadFile(ctx)
-			}
-
-		case "u":
-			// Upload: local to remote
-			if m.activePane == LocalPane && len(m.localFiles) > 0 {
-				ctx := m.ctxMap[m.serial]
-				return m, m.uploadFile(ctx)
-			}
-
-		case "delete", "x":
-			// Delete selected item
-			return m, m.confirmDelete()
-
-		case "r":
-			// Refresh both panes
-			m.loadLocalDirectory()
-			m.loadRemoteDirectory()
-			m.refreshStatus = "✓ Refreshed"
-			m.refreshStatusTime = time.Now()
-
-		case "C":
-			// Cancel all transfers
-			m.cancelAllTransfers()
-			m.statusMsg = "Cancellation requested..."
-			m.loadLocalDirectory()
-			m.loadRemoteDirectory()
-		}
-
-	case TransferStatusMsg:
-		if msg.BytesSec > 0 {
-			m.transferQueue.currentSpeed = msg.BytesSec
-		}
-
-		if msg.Total > 0 {
-			// standard update
-		}
-
-		// m.statusMsg = fmt.Sprintf("Queue: %d pending, %d active, %d done", msg.Pending, msg.Active, msg.Completed)
-		if msg.Err != nil {
-			m.err = fmt.Errorf("Transfer error (%s): %v", msg.Last, msg.Err)
-		} else if msg.Last != "" {
-			// Auto refresh on completion
-			if m.transferQueue.active == 0 && m.transferQueue.pending == 0 {
-				m.statusMsg = "Transfer queue completed!"
-				m.transferQueue.currentSpeed = 0
-				m.transferQueue.currentPercent = 0 // Reset percentage
+				m.localPath = filepath.Dir(m.localPath)
+				m.localCursor = 0
 				m.loadLocalDirectory()
+			} else {
+				m.remotePath = filepath.Dir(m.remotePath)
+				if m.remotePath == "" || m.remotePath == "." {
+					m.remotePath = "/"
+				}
+				m.remoteCursor = 0
 				m.loadRemoteDirectory()
 			}
+			return m, nil
+
+		case "u":
+			// Upload
+			m.uploadSelected()
+			return m, nil
+
+		case "d":
+			// Download
+			m.downloadSelected()
+			return m, nil
+
+		case "delete", "del":
+			// Delete with confirmation
+			m.confirmingDelete = true
+			return m, nil
+
+		case "r":
+			// Refresh both directories
+			m.loadLocalDirectory()
+			m.loadRemoteDirectory()
+			m.statusMsg = "Refreshed"
+			return m, nil
+
+		case "c":
+			// Cancel all transfers
+			m.taskQueue.CancelAllTasks()
+			m.statusMsg = "All transfers cancelled"
+			return m, nil
+
+		case "q", "ctrl+c":
+			return m, tea.Quit
+
+		case "alt+r":
+			m.toggleRsync()
+			return m, nil
+
+		case "esc":
+			if m.searchInput.Value() != "" {
+				m.searchInput.SetValue("")
+				m.updateFilter()
+				return m, nil
+			}
+
+		case "f":
+			m.searching = true
+			m.searchInput.Focus()
+			m.searchInput.SetValue("")
+			// Clear previous filter? Or keep?
+			// Usually start fresh
+			m.updateFilter()
+			return m, nil
 		}
-		// Continue waiting for updates
-		return m, m.waitForTransferUpdate
 	}
 
 	return m, nil
 }
 
-func (m *SFTPDualModel) handleLocalEnter() tea.Cmd {
-	if len(m.localFiles) == 0 || m.localCursor >= len(m.localFiles) {
-		return nil
+func (m *SFTPDualModel) toggleRsync() {
+	settings := m.store.Get()
+	newState := !settings.DisableRsync
+
+	err := m.store.SetDisableRsync(newState)
+	if err != nil {
+		m.addLog(fmt.Sprintf("[ERROR] Failed to save settings: %v", err))
+		return
 	}
 
-	file := m.localFiles[m.localCursor]
-	path := filepath.Join(m.localPath, file.Name)
+	// Update task queue settings reference
+	newSettings := m.store.Get()
+	m.taskQueue.UpdateSettings(&newSettings)
 
-	if file.IsDir {
-		// Change directory
-		m.localPath = path
-		m.localCursor = 0
-		m.loadLocalDirectory()
-		return nil
-	}
-
-	// Open file in editor
-	return m.openInEditor(path)
-}
-
-func (m *SFTPDualModel) handleRemoteEnter() tea.Cmd {
-	if len(m.remoteFiles) == 0 || m.remoteCursor >= len(m.remoteFiles) {
-		return nil
-	}
-
-	file := m.remoteFiles[m.remoteCursor]
-	path := path.Join(m.remotePath, file.Name)
-
-	if file.IsDir {
-		// Change directory
-		m.remotePath = path
-		m.remoteCursor = 0
-		m.loadRemoteDirectory()
-		return nil
-	}
-
-	// Check file size
-	if file.Size > MaxEditSize {
-		// Prompt to download
-		m.confirmingDownload = true
-		m.pendingFile = &file
-		return nil
-	}
-
-	// For smaller files, download to temp and open
-	return func() tea.Msg {
-		tempDir := os.TempDir()
-		tempPath := filepath.Join(tempDir, file.Name)
-
-		err := m.sftpClient.Download(path, tempPath, nil)
-		if err != nil {
-			return TransferStatusMsg{Err: fmt.Errorf("failed to download temp file: %w", err), Last: file.Name}
-		}
-
-		// Open in editor
-		return m.openInEditor(tempPath)()
+	if !newState {
+		m.addLog("[INFO] Rsync ENABLED")
+	} else {
+		m.addLog("[INFO] Rsync DISABLED (Using Internal/SFTP)")
 	}
 }
 
-// openInEditor returns a command that opens the file in $EDITOR
-func (m *SFTPDualModel) openInEditor(path string) tea.Cmd {
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "nano" // Fallback
-	}
-
-	c := exec.Command(editor, path)
-	return tea.ExecProcess(c, func(err error) tea.Msg {
-		if err != nil {
-			return TransferStatusMsg{Err: fmt.Errorf("failed to open editor: %w", err), Last: filepath.Base(path)}
-		}
-		return nil
-	})
-}
-
-func (m *SFTPDualModel) downloadFile(ctx context.Context) tea.Cmd {
-	if m.remoteCursor >= len(m.remoteFiles) || m.remoteFiles[m.remoteCursor].Name == ".." {
-		return nil
-	}
-
-	file := m.remoteFiles[m.remoteCursor]
-	remotePath := path.Join(m.remotePath, file.Name)
-	localPath := filepath.Join(m.localPath, file.Name)
-
-	// Reset queue stats for new batch if empty
-	if m.transferQueue.pending == 0 && m.transferQueue.active == 0 {
-		m.transferQueue.total = 0
-		m.transferQueue.completed = 0
-		m.transferQueue.failed = 0
-	}
-
-	return func() tea.Msg {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		if file.IsDir {
-			m.queueDownloadDir(ctx, remotePath, localPath)
-		} else {
-
-			m.queueJob(TransferJob{
-				Type:       TransferDownload,
-				SourcePath: remotePath,
-				DestPath:   localPath,
-				FileName:   file.Name,
-				Size:       file.Size,
-				Serial:     m.serial,
-			})
-		}
-		return nil
-	}
-}
-
-func (m *SFTPDualModel) createFolder(name string) tea.Cmd {
-	m.creatingFolder = false
-	m.input.Blur()
-	m.input.Reset()
-
-	return func() tea.Msg {
-		var err error
-		if m.activePane == LocalPane {
-			path := filepath.Join(m.localPath, name)
-			err = os.Mkdir(path, 0755)
-			if err == nil {
-				m.loadLocalDirectory()
-				m.statusMsg = fmt.Sprintf("Created local folder: %s", name)
-			}
-		} else {
-			path := path.Join(m.remotePath, name)
-			err = m.sftpClient.Mkdir(path)
-			if err == nil {
-				m.loadRemoteDirectory()
-				m.statusMsg = fmt.Sprintf("Created remote folder: %s", name)
-			}
-		}
-
-		if err != nil {
-			m.err = fmt.Errorf("failed to create folder: %w", err)
-			return nil
-		}
-		return nil
-	}
-}
-
-func (m *SFTPDualModel) confirmDelete() tea.Cmd {
-	var file *sftp.FileInfo
+func (m *SFTPDualModel) updateFilter() {
+	term := strings.ToLower(m.searchInput.Value())
 
 	if m.activePane == LocalPane {
-		if m.localCursor >= len(m.localFiles) || m.localFiles[m.localCursor].Name == ".." {
-			return nil
+		if term == "" {
+			m.displayLocalFiles = m.localFiles
+		} else {
+			var filtered []LocalFileInfo
+			// Always keep ".." if present? Usually yes.
+			for _, f := range m.localFiles {
+				if f.Name == ".." {
+					filtered = append(filtered, f)
+					continue
+				}
+				if strings.Contains(strings.ToLower(f.Name), term) {
+					filtered = append(filtered, f)
+				}
+			}
+			m.displayLocalFiles = filtered
 		}
-		f := m.localFiles[m.localCursor]
-		// Convert to standard FileInfo
-		file = &sftp.FileInfo{Name: f.Name, IsDir: f.IsDir, Size: f.Size}
+		// Reset cursor if out of bounds
+		if m.localCursor >= len(m.displayLocalFiles) {
+			m.localCursor = 0
+		}
 	} else {
-		if m.remoteCursor >= len(m.remoteFiles) || m.remoteFiles[m.remoteCursor].Name == ".." {
-			return nil
+		if term == "" {
+			m.displayRemoteFiles = m.remoteFiles
+		} else {
+			var filtered []sftp.FileInfo
+			for _, f := range m.remoteFiles {
+				if f.Name == ".." {
+					filtered = append(filtered, f)
+					continue
+				}
+				if strings.Contains(strings.ToLower(f.Name), term) {
+					filtered = append(filtered, f)
+				}
+			}
+			m.displayRemoteFiles = filtered
 		}
-		f := m.remoteFiles[m.remoteCursor]
-		file = &f
+		if m.remoteCursor >= len(m.displayRemoteFiles) {
+			m.remoteCursor = 0
+		}
 	}
-
-	m.pendingFile = file
-	m.confirmingDelete = true
-	return nil
 }
 
-func (m *SFTPDualModel) deletePendingItem() tea.Cmd {
-	return func() tea.Msg {
-		name := m.pendingFile.Name
-		var err error
-		var fullPath string
+// IsSearchActive returns true if search mode is active or a filter is applied
+func (m *SFTPDualModel) IsSearchActive() bool {
+	return m.searching || m.searchInput.Value() != ""
+}
 
-		if m.activePane == LocalPane {
-			fullPath = filepath.Join(m.localPath, name)
-			// Recursive local delete
-			err = os.RemoveAll(fullPath)
-			m.loadLocalDirectory()
-		} else {
-			fullPath = path.Join(m.remotePath, name)
-			// Recursive remote delete
-			if m.pendingFile.IsDir {
-				err = m.sftpClient.RemoveDirectory(fullPath)
-			} else {
-				err = m.sftpClient.Delete(fullPath)
-			}
-			m.loadRemoteDirectory()
+func (m *SFTPDualModel) navigate() {
+	if m.activePane == LocalPane {
+		if m.localCursor >= len(m.displayLocalFiles) { // Use Display
+			return
+		}
+		file := m.displayLocalFiles[m.localCursor] // Use Display
+		if !file.IsDir {
+			return
 		}
 
-		m.pendingFile = nil
+		if file.Name == ".." {
+			m.localPath = filepath.Dir(m.localPath)
+		} else {
+			m.localPath = filepath.Join(m.localPath, file.Name)
+		}
+		m.localCursor = 0
+		m.loadLocalDirectory()
+	} else {
+		if m.remoteCursor >= len(m.displayRemoteFiles) { // Use Display
+			return
+		}
+		file := m.displayRemoteFiles[m.remoteCursor] // Use Display
+		if !file.IsDir {
+			return
+		}
+
+		if file.Name == ".." {
+			m.remotePath = filepath.Dir(m.remotePath)
+			if m.remotePath == "" || m.remotePath == "." {
+				m.remotePath = "/"
+			}
+		} else {
+			m.remotePath = filepath.Join(m.remotePath, file.Name)
+		}
+		m.remoteCursor = 0
+		m.loadRemoteDirectory()
+	}
+}
+
+// shortenPath returns a shortened version of the path for display
+func shortenPath(fullPath, basePath string) string {
+	if strings.HasPrefix(fullPath, basePath) {
+		rel := strings.TrimPrefix(fullPath, basePath)
+		rel = strings.TrimPrefix(rel, string(filepath.Separator))
+		if rel == "" {
+			return filepath.Base(fullPath)
+		}
+		return rel
+	}
+	return filepath.Base(fullPath)
+}
+
+func (m *SFTPDualModel) uploadSelected() {
+	if m.activePane != LocalPane || m.localCursor >= len(m.displayLocalFiles) { // Use display
+		return
+	}
+
+	file := m.displayLocalFiles[m.localCursor] // Use display
+	if file.Name == ".." {
+		return
+	}
+
+	localPath := filepath.Join(m.localPath, file.Name)
+	remotePath := filepath.Join(m.remotePath, file.Name)
+
+	taskType := sftp.TaskUploadFile
+	if file.IsDir {
+		taskType = sftp.TaskUploadDirectory
+	}
+
+	_, err := m.taskQueue.QueueTask(taskType, localPath, remotePath, file.Name)
+	if err != nil {
+		m.statusMsg = fmt.Sprintf("Upload failed: %v", err)
+		m.addLog(fmt.Sprintf("ERROR: %v", err))
+	} else {
+		m.statusMsg = fmt.Sprintf("Uploading: %s", file.Name)
+		shortLocal := shortenPath(localPath, m.localPath)
+		shortRemote := shortenPath(remotePath, m.remotePath)
+		m.addLog(fmt.Sprintf("Upload: %s → %s", shortLocal, shortRemote))
+	}
+}
+
+func (m *SFTPDualModel) downloadSelected() {
+	if m.activePane != RemotePane || m.remoteCursor >= len(m.displayRemoteFiles) { // Use display
+		return
+	}
+
+	file := m.displayRemoteFiles[m.remoteCursor] // Use display
+	if file.Name == ".." {
+		return
+	}
+
+	m.pendingFile = &file // Store for confirmation
+	m.confirmingDownload = true
+}
+
+func (m *SFTPDualModel) deleteSelected() {
+	if m.activePane == LocalPane {
+		if m.localCursor >= len(m.displayLocalFiles) { // Use display
+			return
+		}
+		file := m.displayLocalFiles[m.localCursor] // Use display
+		if file.Name == ".." {
+			return
+		}
+
+		path := filepath.Join(m.localPath, file.Name)
+		var err error
+		if file.IsDir {
+			err = os.RemoveAll(path)
+		} else {
+			err = os.Remove(path)
+		}
 
 		if err != nil {
-			log.Printf("Failed to delete item: %s. Error: %v", fullPath, err)
-			return TransferStatusMsg{Err: fmt.Errorf("failed to delete %s: %w", name, err)}
+			m.statusMsg = fmt.Sprintf("Delete failed: %v", err)
+			m.addLog(fmt.Sprintf("ERROR: %v", err))
 		} else {
-			log.Printf("Successfully deleted item: %s", fullPath)
-			return TransferStatusMsg{Last: fmt.Sprintf("Deleted %s", name)} // Reuse message for generic status
+			m.statusMsg = fmt.Sprintf("Deleted: %s", file.Name)
+			shortPath := shortenPath(path, m.localPath)
+			m.addLog(fmt.Sprintf("Deleted local: %s", shortPath))
+			m.loadLocalDirectory()
 		}
-	}
-}
-
-func (m *SFTPDualModel) queueDownloadDir(ctx context.Context, remotePath, localPath string) {
-	// Check for rsync availability
-	if _, err := exec.LookPath("rsync"); err == nil {
-		// Queue a single directory transfer job
-		m.queueJob(TransferJob{
-			Type:        TransferDownload,
-			SourcePath:  remotePath,
-			DestPath:    localPath,
-			FileName:    filepath.Base(localPath),
-			Size:        0, // Size unknown for directories
-			Serial:      m.serial,
-			IsDirectory: true,
-		})
-		return
-	}
-
-	// Fallback to individual file queueing if rsync is not available
-	// Create local dir
-	os.MkdirAll(localPath, 0755)
-
-	files, err := m.sftpClient.List(remotePath)
-	if err != nil {
-		m.err = err
-		return
-	}
-
-	for _, f := range files {
-		select {
-		case <-ctx.Done():
+	} else {
+		if m.remoteCursor >= len(m.displayRemoteFiles) { // Use display
 			return
-		default:
 		}
-		rPath := path.Join(remotePath, f.Name)
-		lPath := filepath.Join(localPath, f.Name)
-		if f.IsDir {
-			m.queueDownloadDir(ctx, rPath, lPath)
-		} else {
-			// Skip non-regular files on download too (e.g. remote symlinks)
-			if !f.Mode.IsRegular() {
-				log.Printf("Skipping remote non-regular file: %s (%v)", rPath, f.Mode)
-				continue
-			}
-
-			m.queueJob(TransferJob{
-				Type:        TransferDownload,
-				SourcePath:  rPath,
-				DestPath:    lPath,
-				FileName:    f.Name,
-				Size:        f.Size,
-				Serial:      m.serial,
-				IsDirectory: false,
-			})
+		file := m.displayRemoteFiles[m.remoteCursor] // Use display
+		if file.Name == ".." {
+			return
 		}
-	}
-}
 
-func (m *SFTPDualModel) queueJob(job TransferJob) {
-	if m.serial != job.Serial {
-		return
-	}
-	m.transferQueue.total++
-	m.transferQueue.pending++
-	m.transferQueue.jobs <- job
-	m.notifyTransferUpdate(nil, "")
-}
+		path := filepath.Join(m.remotePath, file.Name)
+		var err error
 
-func (m *SFTPDualModel) uploadFile(ctx context.Context) tea.Cmd {
-	if m.localCursor >= len(m.localFiles) || m.localFiles[m.localCursor].Name == ".." {
-		return nil
-	}
-
-	file := m.localFiles[m.localCursor]
-	localPath := filepath.Join(m.localPath, file.Name)
-	remotePath := path.Join(m.remotePath, file.Name)
-
-	// Reset queue stats for new batch
-	if m.transferQueue.pending == 0 && m.transferQueue.active == 0 {
-		m.transferQueue.total = 0
-		m.transferQueue.completed = 0
-		m.transferQueue.failed = 0
-	}
-
-	return func() tea.Msg {
 		if file.IsDir {
-			m.queueUploadDir(ctx, localPath, remotePath)
+			// Use SSH rm -rf for directories
+			cmd := fmt.Sprintf("rm -rf %s", path)
+			_, err = m.sshClient.Execute(cmd)
 		} else {
-			// Check if single file is regular
-			// We need to Lstat to be sure, but we only have LocalFileInfo (which comes from ReadDir usually)
-			// LocalFileInfo in sftp_dual.go struct definition is not standard os.FileInfo.
-			// Let's rely on os.Lstat for safety here.
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-			}
-			info, err := os.Lstat(localPath)
-			if err == nil && !info.Mode().IsRegular() {
-				log.Printf("Skipping single non-regular file: %s", localPath)
-				return nil
-			}
-
-			m.queueJob(TransferJob{
-				Type:       TransferUpload,
-				SourcePath: localPath,
-				DestPath:   remotePath,
-				FileName:   file.Name,
-				Size:       file.Size,
-				Serial:     m.serial,
-			})
+			// Use SFTP delete for files
+			err = m.sftpClient.Delete(path)
 		}
-		return nil
+
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("Delete failed: %v", err)
+			m.addLog(fmt.Sprintf("ERROR: %v", err))
+		} else {
+			m.statusMsg = fmt.Sprintf("Deleted: %s", file.Name)
+			shortPath := shortenPath(path, m.remotePath)
+			m.addLog(fmt.Sprintf("Deleted remote: %s", shortPath))
+			m.loadRemoteDirectory()
+		}
 	}
 }
 
-func (m *SFTPDualModel) queueUploadDir(ctx context.Context, localPath, remotePath string) {
-	// Check for rsync availability
-	if _, err := exec.LookPath("rsync"); err == nil {
-		// Queue a single directory transfer job
-		m.queueJob(TransferJob{
-			Type:        TransferUpload,
-			SourcePath:  localPath,
-			DestPath:    remotePath,
-			FileName:    filepath.Base(localPath),
-			Size:        0, // Size unknown for directories
-			Serial:      m.serial,
-			IsDirectory: true,
-		})
-		return
-	}
-
-	// Fallback to individual file queueing if rsync is not available
-	// Create remote dir
-	m.sftpClient.Mkdir(remotePath)
-
-	entries, err := os.ReadDir(localPath)
-	if err != nil {
-		m.err = err
-		return
-	}
-
-	for _, entry := range entries {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		lPath := filepath.Join(localPath, entry.Name())
-		rPath := path.Join(remotePath, entry.Name())
-		info, _ := entry.Info()
-
-		if entry.IsDir() {
-			m.queueUploadDir(ctx, lPath, rPath)
+func (m *SFTPDualModel) createFolder(name string) {
+	if m.activePane == LocalPane {
+		path := filepath.Join(m.localPath, name)
+		err := os.MkdirAll(path, 0755)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("Create folder failed: %v", err)
 		} else {
-			// Skip non-regular files (symlinks, junctions, devices) to avoid "Incorrect function" errors
-			if !entry.Type().IsRegular() {
-				log.Printf("Skipping non-regular file: %s (Type: %v)", lPath, entry.Type())
-				continue
-			}
-
-			m.queueJob(TransferJob{
-				Type:        TransferUpload,
-				SourcePath:  lPath,
-				DestPath:    rPath,
-				FileName:    entry.Name(),
-				Size:        info.Size(),
-				Serial:      m.serial,
-				IsDirectory: false,
-			})
+			m.statusMsg = fmt.Sprintf("Created: %s", name)
+			m.loadLocalDirectory()
+		}
+	} else {
+		path := filepath.Join(m.remotePath, name)
+		err := m.sftpClient.Mkdir(path)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("Create folder failed: %v", err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Created: %s", name)
+			m.loadRemoteDirectory()
 		}
 	}
 }
 
 func (m *SFTPDualModel) View() string {
+	if m.width == 0 {
+		return "Loading..."
+	}
+
 	var b strings.Builder
 
-	// Title
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#7D56F4")).
-		Padding(0, 1)
-	b.WriteString(titleStyle.Render("📁 SFTP File Manager"))
-	b.WriteString("\n\n")
-
-	// ===== RESPONSIVE HEIGHT CALCULATION =====
-	const (
-		titleLines         = 2  // Title + spacing
-		helpLines          = 1  // Help text
-		statusLines        = 2  // Status messages (can be 1-3 lines but reserve 2)
-		outputHeaderLines  = 1  // "Rsync Output:" header
-		outputContentLines = 10 // 10 lines of output
-		spacing            = 2  // Extra spacing
-	)
-
-	bottomHeight := outputHeaderLines + outputContentLines
-	midHeight := statusLines
-	topHeight := m.height - titleLines - helpLines - midHeight - bottomHeight - spacing
-	if topHeight < 15 {
-		topHeight = 15 // Minimum height for panels
-	}
-
-	// ===== TOP SECTION: DUAL PANELS =====
-	paneWidth := (m.width - 4) / 2 // -4 for spacing between panels
-	if paneWidth < 30 {
-		paneWidth = 30
-	}
-
-	// Panel styles
-	activeBorderStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#7D56F4")).
-		Padding(0, 1).
-		Height(topHeight)
-
-	inactiveBorderStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#626262")).
-		Padding(0, 1).
-		Height(topHeight)
-
-	// Render panels
-	localPane := m.renderLocalPane(paneWidth, topHeight)
-	if m.activePane == LocalPane {
-		localPane = activeBorderStyle.Render(localPane)
-	} else {
-		localPane = inactiveBorderStyle.Render(localPane)
-	}
-
-	remotePane := m.renderRemotePane(paneWidth, topHeight)
-	if m.activePane == RemotePane {
-		remotePane = activeBorderStyle.Render(remotePane)
-	} else {
-		remotePane = inactiveBorderStyle.Render(remotePane)
-	}
-
-	// Join panels horizontally
-	panes := lipgloss.JoinHorizontal(lipgloss.Top, localPane, "  ", remotePane)
-	b.WriteString(panes)
-	b.WriteString("\n\n")
-
-	// ===== MIDDLE SECTION: STATUS/PROGRESS =====
-	// Show refresh status if recent (within 2 seconds)
-	if m.refreshStatus != "" && time.Since(m.refreshStatusTime) < 2*time.Second {
-		b.WriteString(successStyle.Render(m.refreshStatus))
-		b.WriteString("\n")
-	}
-
-	// Help text (always visible)
-	b.WriteString(helpStyle.Render("tab: switch • enter: open • u: upload • d: download • r: refresh • C: cancel • esc: back"))
-
-	// Status/progress (if active)
-	if m.transferQueue.active > 0 || m.transferQueue.pending > 0 {
-		b.WriteString("\n")
-		speed := formatSpeed(m.transferQueue.currentSpeed)
-
-		var status string
-		if m.transferQueue.currentPercent > 0 {
-			status = fmt.Sprintf("🚀 %d%% | %s | Active: %d | Pending: %d | Done: %d/%d",
-				m.transferQueue.currentPercent,
-				speed,
-				m.transferQueue.active,
-				m.transferQueue.pending,
-				m.transferQueue.completed,
-				m.transferQueue.total)
-		} else {
-			status = fmt.Sprintf("🚀 %s | Active: %d | Pending: %d | Done: %d/%d",
-				speed,
-				m.transferQueue.active,
-				m.transferQueue.pending,
-				m.transferQueue.completed,
-				m.transferQueue.total)
-		}
-		b.WriteString(successStyle.Render(status))
-	} else if m.statusMsg != "" {
-		b.WriteString("\n")
-		b.WriteString(successStyle.Render("✓ " + m.statusMsg))
-	}
-
-	if m.err != nil {
-		b.WriteString("\n")
-		b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
-	}
-
-	b.WriteString("\n")
-
-	// ===== BOTTOM SECTION: COMMAND OUTPUT =====
-	outputHeaderStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#666")).
-		Bold(true)
-	b.WriteString(outputHeaderStyle.Render("Command Output:"))
-
-	m.mu.Lock()
-	lineCount := len(m.rsyncOutputLines)
-	for i := 0; i < 10; i++ {
-		b.WriteString("\n")
-		if i < lineCount {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#888")).Render(m.rsyncOutputLines[i]))
-		} else {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#333")).Render("—"))
-		}
-	}
-	m.mu.Unlock()
-
-	// ===== POPUPS (overlays) =====
-	// Input popup
-	if m.creatingFolder {
-		popupStyle := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#7D56F4")).
-			Padding(1, 2).
-			Width(50)
-
-		inputView := popupStyle.Render(
-			fmt.Sprintf("Create New Folder\n\n%s", m.input.View()),
-		)
-		b.WriteString("\n\n")
-		b.WriteString(inputView)
-	}
-
-	// Download confirmation
-	if m.confirmingDownload {
-		popupStyle := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#FFA500")).
-			Padding(1, 2).
-			Width(60)
-
-		msg := fmt.Sprintf("⚠️  File is too large to edit directly (>10MB).\n\nDownload '%s' to local folder instead?\n\n(y/n)", m.pendingFile.Name)
-		popupView := popupStyle.Render(msg)
-		b.WriteString("\n\n")
-		b.WriteString(popupView)
-	}
-
-	// Delete confirmation
+	// Show confirmation dialogs if active
 	if m.confirmingDelete {
-		popupStyle := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#FF0000")).
-			Padding(1, 2).
-			Width(60)
+		fileName := ""
+		if m.activePane == LocalPane && m.localCursor < len(m.displayLocalFiles) {
+			fileName = m.displayLocalFiles[m.localCursor].Name
+		} else if m.activePane == RemotePane && m.remoteCursor < len(m.displayRemoteFiles) {
+			fileName = m.displayRemoteFiles[m.remoteCursor].Name
+		}
 
-		msg := fmt.Sprintf("🗑️  Are you sure you want to PERMANENTLY delete:\n\n'%s'\n\n(y/n)", m.pendingFile.Name)
-		popupView := popupStyle.Render(msg)
-		b.WriteString("\n\n")
-		b.WriteString(popupView)
+		b.WriteString("\n")
+		b.WriteString(strings.Repeat("═", m.width) + "\n")
+		b.WriteString(" ⚠️  DELETE CONFIRMATION\n")
+		b.WriteString(strings.Repeat("─", m.width) + "\n")
+		b.WriteString(fmt.Sprintf(" Are you sure you want to delete: %s\n", fileName))
+		b.WriteString(" Press 'Y' to confirm, 'N' or 'Esc' to cancel\n")
+		b.WriteString(strings.Repeat("═", m.width) + "\n")
+		b.WriteString("\n")
+		return b.String()
 	}
+
+	if m.confirmingDownload {
+		fileName := ""
+		if m.pendingFile != nil {
+			fileName = m.pendingFile.Name
+		}
+
+		b.WriteString("\n")
+		b.WriteString(strings.Repeat("═", m.width) + "\n")
+		b.WriteString(" 📥 DOWNLOAD CONFIRMATION\n")
+		b.WriteString(strings.Repeat("─", m.width) + "\n")
+		b.WriteString(fmt.Sprintf(" Download: %s\n", fileName))
+		b.WriteString(" Press 'Y' to confirm, 'N' or 'Esc' to cancel\n")
+		b.WriteString(strings.Repeat("═", m.width) + "\n")
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	// Height Calculation Strategy
+	// We have 3 parts: Panes (Top), Progress (Middle), Logs (Bottom).
+	// We want Panes to be dominant.
+
+	// 1. Calculate explicit heights
+
+	// Progress Height: Flexible but reasonable limit
+	// Header (3 lines) + Tasks (min 1, max 5) -> 4-8 lines
+	currentTasksCount := len(m.currentTasks)
+	if currentTasksCount == 0 {
+		currentTasksCount = 1
+	} // "No active transfers" line
+	progressHeight := 3 + currentTasksCount
+
+	// Logs Height: Flexible
+	// Header(2) + Spacer(1) + Status(1) + Error(1) + Logs(max 10)
+	// Max possible needed = 5 + 10 = 15
+	targetLogHeight := 15
+
+	// Available height
+	totalHeight := m.height
+
+	// Ensure we don't use too much for bottom panels
+	maxBottomHeight := int(float64(totalHeight) * 0.4) // Bottom 40% max for logs+progress
+
+	// Adjust
+	if progressHeight+targetLogHeight > maxBottomHeight {
+		// Compress if needed
+		targetLogHeight = maxBottomHeight - progressHeight
+		// if targetLogHeight < 5 { // Minimum practical log height
+		// 	targetLogHeight = 5
+		// 	// If still too big, eat into panes, but usually 5 is fine
+		// }
+	}
+
+	// Panes take the rest
+	// -2 for newlines between sections
+	paneHeight := totalHeight - progressHeight - targetLogHeight - 2
+
+	if paneHeight < 5 {
+		// Critical failure case (terminal too small)
+		// Try to show just panes? or squish everything
+		paneHeight = 5
+	}
+
+	paneWidth := m.width / 2
+
+	b.WriteString(m.renderDualPanes(paneHeight, paneWidth))
+	b.WriteString("\n")
+
+	// Part 2: Status/Progress
+	b.WriteString(m.renderProgress(progressHeight))
+	b.WriteString("\n")
+
+	// Part 3: Last output
+	b.WriteString(m.renderLastOutput(targetLogHeight))
 
 	return b.String()
 }
 
-func formatSpeed(bytesSec float64) string {
-	if bytesSec < 1024 {
-		return fmt.Sprintf("%.0f B/s", bytesSec)
-	} else if bytesSec < 1024*1024 {
-		return fmt.Sprintf("%.1f KB/s", bytesSec/1024)
+func (m *SFTPDualModel) renderDualPanes(height, width int) string {
+	var b strings.Builder
+
+	// Header
+	localHeader := " LOCAL: " + m.localPath
+	remoteHeader := " REMOTE: " + m.remotePath
+
+	if m.activePane == LocalPane {
+		localHeader = "▶" + localHeader
+		if m.searching {
+			localHeader += " [Search: " + m.searchInput.View() + "]"
+		} else if len(m.displayLocalFiles) != len(m.localFiles) {
+			localHeader += " [Filtered]"
+		}
 	} else {
-		return fmt.Sprintf("%.1f MB/s", bytesSec/(1024*1024))
-	}
-}
-
-func (m *SFTPDualModel) renderLocalPane(width, height int) string {
-	var b strings.Builder
-
-	// Pane title
-	paneTitle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#04B575"))
-	b.WriteString(paneTitle.Render("💻 Local"))
-	b.WriteString("\n")
-
-	// Current path
-	pathStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#626262")).
-		Italic(true)
-	truncatedPath := m.localPath
-	if len(truncatedPath) > width-4 {
-		truncatedPath = "..." + truncatedPath[len(truncatedPath)-(width-7):]
-	}
-	b.WriteString(pathStyle.Render(truncatedPath))
-	b.WriteString("\n\n")
-
-	// Files - calculate display count based on provided height
-	// Overhead: Title(1) + Path(1) + Spacing(1) = 3 lines
-	displayCount := height - 3
-	if displayCount < 5 {
-		displayCount = 5
+		remoteHeader = "▶" + remoteHeader
+		if m.searching {
+			remoteHeader += " [Search: " + m.searchInput.View() + "]"
+		} else if len(m.displayRemoteFiles) != len(m.remoteFiles) {
+			remoteHeader += " [Filtered]"
+		}
 	}
 
-	startIdx := 0
-	if m.localCursor > displayCount/2 && len(m.localFiles) > displayCount {
-		startIdx = m.localCursor - displayCount/2
-	}
-	endIdx := startIdx + displayCount
-	if endIdx > len(m.localFiles) {
-		endIdx = len(m.localFiles)
+	b.WriteString(fmt.Sprintf("%-*s│%-*s\n", width-4, localHeader, width, remoteHeader))
+	b.WriteString(strings.Repeat("─", width-4) + "┼" + strings.Repeat("─", width) + "\n")
+
+	// Calculate scrolling offset
+	maxItems := height - 2
+
+	// Calculate local scroll offset
+	localOffset := 0
+	if m.localCursor >= maxItems {
+		localOffset = m.localCursor - maxItems + 1
 	}
 
-	for i := startIdx; i < endIdx; i++ {
-		file := m.localFiles[i]
-		cursor := "  "
-		style := itemStyle
+	// Calculate remote scroll offset
+	remoteOffset := 0
+	if m.remoteCursor >= maxItems {
+		remoteOffset = m.remoteCursor - maxItems + 1
+	}
 
-		if m.localCursor == i {
-			cursor = "→ "
-			style = selectedItemStyle
+	// File lists
+	dirStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Bold(true)
+
+	for i := 0; i < maxItems; i++ {
+		localIdx := i + localOffset
+		remoteIdx := i + remoteOffset
+
+		// Local pane
+		if localIdx < len(m.displayLocalFiles) { // Use Display Files
+			file := m.displayLocalFiles[localIdx]
+			prefix := "  "
+			isSelected := localIdx == m.localCursor && m.activePane == LocalPane
+			if isSelected {
+				prefix = "► "
+			}
+
+			icon := "📄"
+			if file.IsDir {
+				icon = "📁"
+			}
+
+			sizeStr := formatSize(file.Size)
+			if file.IsDir {
+				sizeStr = "<DIR>"
+			}
+
+			// Name truncation
+			nameWidth := width - 20
+			name := file.Name
+			if len(name) > nameWidth {
+				name = name[:nameWidth-3] + "..."
+			}
+
+			lineContent := fmt.Sprintf("%s%s %-*s %10s", prefix, icon, nameWidth, name, sizeStr)
+
+			// Apply styling
+			style := lipgloss.NewStyle()
+			if file.IsDir {
+				style = dirStyle
+			}
+			if isSelected {
+				style = style.Reverse(true)
+			}
+
+			// Render with fixed width to ensure background covers whole line if selected
+			// We manually padded above, but lipgloss width is safer for background
+			// However, fmt padding is simple. Let's just render.
+			// Note: lipgloss.Style.Render() resets colors, so we shouldn't rely on b.WriteString padding after.
+			// We already padded in Sprintf.
+
+			b.WriteString(style.Render(lineContent))
+
+			// Fill remaining space if Sprintf padding wasn't enough (it should be)
+			// But lipgloss ansi codes don't count towards length in pure string len check
+			// Sprintf is fine because input strings were plain text.
+		} else {
+			b.WriteString(strings.Repeat(" ", width-4))
 		}
 
-		icon := "📄"
-		if file.IsDir {
-			icon = "📁"
+		b.WriteString("│")
+
+		// Remote pane
+		if remoteIdx < len(m.displayRemoteFiles) { // Use Display Files
+			file := m.displayRemoteFiles[remoteIdx]
+			prefix := "  "
+			isSelected := remoteIdx == m.remoteCursor && m.activePane == RemotePane
+			if isSelected {
+				prefix = "► "
+			}
+
+			icon := "📄"
+			if file.IsDir {
+				icon = "📁"
+			}
+
+			sizeStr := formatSize(file.Size)
+			if file.IsDir {
+				sizeStr = "<DIR>"
+			}
+
+			nameWidth := width - 20
+			name := file.Name
+			if len(name) > nameWidth {
+				name = name[:nameWidth-3] + "..."
+			}
+
+			lineContent := fmt.Sprintf("%s%s %-*s %10s", prefix, icon, nameWidth, name, sizeStr)
+
+			style := lipgloss.NewStyle()
+			if file.IsDir {
+				style = dirStyle
+			}
+			if isSelected {
+				style = style.Reverse(true)
+			}
+
+			b.WriteString(style.Render(lineContent))
+		} else {
+			b.WriteString(strings.Repeat(" ", width-3))
 		}
 
-		name := file.Name
-		if len(name) > width-15 {
-			name = name[:width-18] + "..."
-		}
-
-		line := fmt.Sprintf("%s %s", icon, name)
-		b.WriteString(cursor + style.Render(line))
 		b.WriteString("\n")
 	}
 
 	return b.String()
 }
 
-func (m *SFTPDualModel) renderRemotePane(width, height int) string {
+func (m *SFTPDualModel) renderProgress(height int) string {
 	var b strings.Builder
 
-	// Pane title
-	paneTitle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#FFA500"))
-	b.WriteString(paneTitle.Render("🌐 Remote"))
-	b.WriteString("\n")
+	b.WriteString("═" + strings.Repeat("═", m.width-2) + "═\n")
+	b.WriteString(" TRANSFERS & PROGRESS\n")
+	b.WriteString(strings.Repeat("─", m.width) + "\n")
 
-	// Current path
-	pathStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#626262")).
-		Italic(true)
-	truncatedPath := m.remotePath
-	if len(truncatedPath) > width-4 {
-		truncatedPath = "..." + truncatedPath[len(truncatedPath)-(width-7):]
-	}
-	b.WriteString(pathStyle.Render(truncatedPath))
-	b.WriteString("\n\n")
+	if len(m.currentTasks) == 0 {
+		b.WriteString(" No active transfers\n")
+	} else {
+		for _, task := range m.currentTasks {
+			var stateStr, progressStr string
 
-	// Files - calculate display count based on provided height
-	// Overhead: Title(1) + Path(1) + Spacing(1) = 3 lines
-	displayCount := height - 3
-	if displayCount < 5 {
-		displayCount = 5
-	}
+			switch task.State {
+			case sftp.TaskScanning:
+				stateStr = "🔍 Scanning"
+				progressStr = "..."
+			case sftp.TaskTransferring:
+				stateStr = "📤 Transfer"
+				if task.TotalFiles > 0 {
+					progressStr = fmt.Sprintf("%d/%d files (%d%%) %.2f MB/s",
+						task.CompletedFiles,
+						task.TotalFiles,
+						task.Percentage,
+						task.CurrentSpeed/1024/1024)
+				} else {
+					progressStr = "In progress..."
+				}
+			case sftp.TaskCompleted:
+				stateStr = "✓ Done"
+				progressStr = fmt.Sprintf("%d files", task.CompletedFiles)
+			case sftp.TaskFailed:
+				stateStr = "✗ Failed"
+				progressStr = "Error"
+			case sftp.TaskCancelled:
+				stateStr = "⊘ Cancelled"
+				progressStr = ""
+			default:
+				stateStr = "⏳ Pending"
+				progressStr = ""
+			}
 
-	startIdx := 0
-	if m.remoteCursor > displayCount/2 && len(m.remoteFiles) > displayCount {
-		startIdx = m.remoteCursor - displayCount/2
-	}
-	endIdx := startIdx + displayCount
-	if endIdx > len(m.remoteFiles) {
-		endIdx = len(m.remoteFiles)
-	}
-
-	for i := startIdx; i < endIdx; i++ {
-		file := m.remoteFiles[i]
-		cursor := "  "
-		style := itemStyle
-
-		if m.remoteCursor == i {
-			cursor = "→ "
-			style = selectedItemStyle
+			taskLine := fmt.Sprintf(" Task #%d: %s - %s\n", task.TaskID, stateStr, progressStr)
+			b.WriteString(taskLine)
 		}
+	}
 
-		icon := "📄"
-		if file.IsDir {
-			icon = "📁"
+	return b.String()
+}
+
+func (m *SFTPDualModel) renderLastOutput(height int) string {
+	if height <= 0 {
+		return ""
+	}
+	var b strings.Builder
+
+	// Header takes 2 lines (Divider + Controls)
+	// Status/Error take 1-2 lines
+	// Spacer takes 1 line
+
+	// Pre-calculate fixed usage
+	fixedUsed := 3 // Divider + Controls + Spacer
+	if m.statusMsg != "" {
+		fixedUsed++
+	}
+	if m.err != nil {
+		fixedUsed++
+	}
+
+	availableForLogs := height - fixedUsed
+	if availableForLogs < 0 {
+		availableForLogs = 0
+	}
+
+	b.WriteString(strings.Repeat("─", m.width) + "\n")
+
+	// Status line with controls and mode
+	controls := "Controls: [U]pload [D]ownload [R]efresh [Alt+R] Toggle Rsync"
+
+	// Rsync Status
+	settings := m.store.Get()
+	mode := "SFTP"
+	if !settings.DisableRsync {
+		mode = "RSYNC"
+	}
+
+	b.WriteString(fmt.Sprintf(" %-60s | Mode: [%s]\n", controls, mode))
+
+	// Print status/error first
+	if m.statusMsg != "" {
+		b.WriteString(fmt.Sprintf(" Status: %s\n", m.statusMsg))
+	}
+	if m.err != nil {
+		b.WriteString(fmt.Sprintf(" Error: %v\n", m.err))
+	}
+
+	b.WriteString("\n") // Spacer
+
+	// Print last N logs that fit
+	count := len(m.logHistory)
+	start := 0
+	if count > availableForLogs {
+		start = count - availableForLogs
+	}
+
+	for i := start; i < count; i++ {
+		logLine := m.logHistory[i]
+		// Truncate if needed
+		if len(logLine) > m.width-2 {
+			logLine = logLine[:m.width-5] + "..."
 		}
-
-		name := file.Name
-		if len(name) > width-15 {
-			name = name[:width-18] + "..."
-		}
-
-		line := fmt.Sprintf("%s %s", icon, name)
-		b.WriteString(cursor + style.Render(line))
-		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf(" %s\n", logLine))
 	}
 
 	return b.String()
