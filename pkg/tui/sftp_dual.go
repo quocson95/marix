@@ -956,7 +956,7 @@ func (m *SFTPDualModel) renderDualPanes(height, width int) string {
 	}
 
 	// File lists
-	dirStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Bold(true)
+	dirStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Bold(true)
 
 	for i := 0; i < maxItems; i++ {
 		localIdx := i + localOffset
