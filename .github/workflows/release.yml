@@ -90,12 +90,13 @@ jobs:
             "build/${{ matrix.artifact_name }}" \
             "dist/"
 
-      # --- Windows EXE ---
-      - name: Package EXE (Windows)
+      # --- Windows Compression ---
+      - name: Compress Windows Binary
         if: matrix.goos == 'windows'
         run: |
-          # Just rename/move implementation if needed, but build/marix.exe is already there
-          mv build/${{ matrix.output_bin }} build/${{ matrix.artifact_name }}
+          cd build
+          7z a -tzip ${{ matrix.artifact_name }} ${{ matrix.output_bin }}
+          cd ..
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
