@@ -22,25 +22,25 @@ jobs:
             goos: linux
             goarch: amd64
             output_bin: marix
-            artifact_name: marix-linux-amd64
-            asset_content_type: application/octet-stream
+            artifact_name: marix-linux-amd64.zip
+            asset_content_type: application/zip
           - runner: windows-latest
             goos: windows
             goarch: amd64
             output_bin: marix.exe
-            artifact_name: marix-windows-amd64.exe
-            asset_content_type: application/vnd.microsoft.portable-executable
+            artifact_name: marix-windows-amd64.zip
+            asset_content_type: application/zip
           - runner: macos-latest
             goos: darwin
             goarch: amd64
             output_bin: marix
-            artifact_name: marix-darwin-amd64.dmg
+            artifact_name: marix-amd64.dmg
             asset_content_type: application/x-apple-diskimage
           - runner: macos-latest
             goos: darwin
             goarch: arm64
             output_bin: marix
-            artifact_name: Marix-arm64.dmg
+            artifact_name: marix-arm64.dmg
             asset_content_type: application/x-apple-diskimage
 
     steps:
@@ -61,11 +61,13 @@ jobs:
           mkdir -p build
           go build -ldflags="-s -w" -o build/${{ matrix.output_bin }} ./cmd/marix
 
-      # --- Linux Static Binary ---
-      - name: Rename Linux Binary
+      # --- Linux Compression ---
+      - name: Compress Linux Binary
         if: matrix.goos == 'linux'
         run: |
-          mv build/${{ matrix.output_bin }} build/${{ matrix.artifact_name }}
+          cd build
+          zip ${{ matrix.artifact_name }} ${{ matrix.output_bin }}
+          cd ..
 
       # --- macOS DMG ---
       - name: Package DMG (macOS)
