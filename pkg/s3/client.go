@@ -96,7 +96,9 @@ func (c *Client) Backup(dataDir, password string) error {
 	}
 
 	// 2. Create Zip
-	timestamp := time.Now().Format("20060102-150405")
+	// timestamp := time.Now().Format("20060102-150405")
+	now := time.Now()
+	timestamp := fmt.Sprintf("%d-%s-%d", now.Year(), now.Month().String(), now.Day())
 	fileName := fmt.Sprintf("backup-%s.enc", timestamp) // .enc extension for encrypted
 	tempZip := filepath.Join(os.TempDir(), "backup-temp.zip")
 

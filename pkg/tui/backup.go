@@ -156,9 +156,13 @@ func (m *BackupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focused = m.cursor
 				m.inputs[m.focused].Focus()
 			} else if m.cursor == len(m.inputs) {
+				// Toggle Auto Backup
+				settings := m.settingsStore.Get()
+				m.settingsStore.SetAutoBackup(!settings.AutoBackup)
+			} else if m.cursor == len(m.inputs)+1 {
 				// Backup
 				return m, m.performBackup()
-			} else if m.cursor == len(m.inputs)+1 {
+			} else if m.cursor == len(m.inputs)+2 {
 				// Restore
 				return m, m.performRestore()
 			}
@@ -198,6 +202,64 @@ func (m *BackupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// AutoBackupMsg is sent when an auto-backup completes
+type AutoBackupMsg struct {
+	Err    error
+	Action string
+}
+
+// AutoBackupCmd creates a command to perform an auto-backup if enabled
+func AutoBackupCmd(settingsStore *storage.SettingsStore) tea.Cmd {
+	return func() tea.Msg {
+		settings := settingsStore.Get()
+		if !settings.AutoBackup {
+			return nil
+		}
+
+		if settings.S3Host == "" || settings.S3AccessKey == "" || settings.S3SecretKey == "" {
+			// Fail silently or log? For auto-backup, maybe quiet failure is better, or just log
+			return AutoBackupMsg{Err: fmt.Errorf("auto-backup skipped: missing S3 config")}
+		}
+
+		return nil // Placeholder for interface matching if needed
+	}
+}
+
+// RunAutoBackup performs the actual backup logic with provided password
+func RunAutoBackup(settingsStore *storage.SettingsStore, password string, action string) tea.Cmd {
+	return func() tea.Msg {
+		settings := settingsStore.Get()
+		if !settings.AutoBackup {
+			return nil
+		}
+
+		host := settings.S3Host
+		access := settings.S3AccessKey
+		secret := settings.S3SecretKey
+
+		if host == "" || access == "" || secret == "" {
+			return AutoBackupMsg{Err: fmt.Errorf("auto-backup failed: missing S3 config"), Action: action}
+		}
+
+		if password == "" {
+			return AutoBackupMsg{Err: fmt.Errorf("auto-backup failed: no password provided"), Action: action}
+		}
+
+		client, err := s3.NewClient(host, access, secret)
+		if err != nil {
+			return AutoBackupMsg{Err: fmt.Errorf("S3 connection failed: %w", err), Action: action}
+		}
+
+		dataDir := settingsStore.GetDataDir()
+		err = client.Backup(dataDir, password)
+		if err != nil {
+			return AutoBackupMsg{Err: err, Action: action}
+		}
+
+		return AutoBackupMsg{Err: nil, Action: action}
+	}
+}
+
 func (m *BackupModel) performBackup() tea.Cmd {
 	return func() tea.Msg {
 		host := m.inputs[backupS3Host].Value()
@@ -212,6 +274,13 @@ func (m *BackupModel) performBackup() tea.Cmd {
 		if password == "" {
 			return BackupMsg{err: fmt.Errorf("backup password is required")}
 		}
+
+		// Save S3 settings to store for future auto-backups
+		settings := m.settingsStore.Get()
+		settings.S3Host = host
+		settings.S3AccessKey = access
+		settings.S3SecretKey = secret
+		m.settingsStore.Update(settings)
 
 		m.s3BackupInProgress = true
 		m.statusMsg = "Creating encrypted backup..."
@@ -244,6 +313,13 @@ func (m *BackupModel) performRestore() tea.Cmd {
 		if password == "" {
 			return RestoreMsg{err: fmt.Errorf("backup password is required")}
 		}
+
+		// Save settings on restore too
+		settings := m.settingsStore.Get()
+		settings.S3Host = host
+		settings.S3AccessKey = access
+		settings.S3SecretKey = secret
+		m.settingsStore.Update(settings)
 
 		m.s3RestoreInProgress = true
 		m.statusMsg = "Restoring from encrypted backup..."
@@ -279,17 +355,31 @@ func (m *BackupModel) View() string {
 
 	s += "\n"
 
+	// Auto Backup Toggle
+	settings := m.settingsStore.Get()
+	cursorAuto := "  "
+	styleAuto := itemStyle
+	if m.cursor == len(m.inputs) {
+		cursorAuto = "→ "
+		styleAuto = selectedItemStyle
+	}
+	autoBackupStatus := "☐"
+	if settings.AutoBackup {
+		autoBackupStatus = "☑"
+	}
+	s += cursorAuto + styleAuto.Render(fmt.Sprintf("%s Auto Backup on Add/Delete Server", autoBackupStatus)) + "\n\n"
+
 	// Actions
 	cursorBackup := " "
 	styleBackup := itemStyle
-	if m.cursor == len(m.inputs) {
+	if m.cursor == len(m.inputs)+1 {
 		cursorBackup = "→"
 		styleBackup = selectedItemStyle
 	}
 
 	cursorRestore := " "
 	styleRestore := itemStyle
-	if m.cursor == len(m.inputs)+1 {
+	if m.cursor == len(m.inputs)+2 {
 		cursorRestore = "→"
 		styleRestore = selectedItemStyle
 	}

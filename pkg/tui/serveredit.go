@@ -164,6 +164,9 @@ func (m *ServerEditModel) updateInputs(msg tea.Msg) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// ServerSavedMsg is sent when a server is successfully saved
+type ServerSavedMsg struct{}
+
 func (m *ServerEditModel) save() tea.Cmd {
 	return func() tea.Msg {
 		// Get values
@@ -286,7 +289,7 @@ func (m *ServerEditModel) save() tea.Cmd {
 
 		m.saved = true
 		m.err = nil
-		return nil
+		return ServerSavedMsg{}
 	}
 }
 

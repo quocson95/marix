@@ -21,6 +21,7 @@ type Settings struct {
 	S3Host             string `json:"s3Host,omitempty"`             // S3 Endpoint
 	S3AccessKey        string `json:"s3AccessKey,omitempty"`        // S3 Access Key
 	S3SecretKey        string `json:"s3SecretKey,omitempty"`        // S3 Secret Key
+	AutoBackup         bool   `json:"autoBackup"`                   // Automatically backup on server add/delete
 	DisableRsync       bool   `json:"disableRsync"`                 // Disable rsync engine
 }
 
@@ -66,6 +67,7 @@ func getDefaultSettings() Settings {
 		TerminalFont:       "monospace",
 		AutoSave:           true,
 		MasterPasswordHash: "", // Empty means no encryption by default
+		AutoBackup:         false,
 		DisableRsync:       false,
 	}
 }
@@ -136,6 +138,14 @@ func (s *SettingsStore) SetAutoSave(autoSave bool) error {
 	defer s.mu.Unlock()
 
 	s.settings.AutoSave = autoSave
+	return s.save()
+}
+
+func (s *SettingsStore) SetAutoBackup(autoBackup bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.settings.AutoBackup = autoBackup
 	return s.save()
 }
 

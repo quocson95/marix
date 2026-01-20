@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/quocson95/marix/pkg/storage"
@@ -26,32 +27,39 @@ type ServerSFTPMsg struct {
 
 // ServersModel manages the server list
 type ServersModel struct {
-	store    *storage.Store
-	servers  []*storage.Server
-	cursor   int
-	err      error
-	width    int
-	height   int
-	sftpMode bool // If true, selecting server opens SFTP instead of terminal
+	store          *storage.Store
+	settingsStore  *storage.SettingsStore
+	masterPassword string
+	servers        []*storage.Server
+	cursor         int
+	err            error
+	statusMsg      string
+	width          int
+	height         int
+	sftpMode       bool // If true, selecting server opens SFTP instead of terminal
 }
 
 // NewServersModel creates a new servers model
-func NewServersModel(store *storage.Store) *ServersModel {
+func NewServersModel(store *storage.Store, settingsStore *storage.SettingsStore, masterPassword string) *ServersModel {
 	return &ServersModel{
-		store:    store,
-		servers:  store.List(),
-		cursor:   0,
-		sftpMode: false,
+		store:          store,
+		settingsStore:  settingsStore,
+		masterPassword: masterPassword,
+		servers:        store.List(),
+		cursor:         0,
+		sftpMode:       false,
 	}
 }
 
 // NewServersModelForSFTP creates servers model for SFTP selection
-func NewServersModelForSFTP(store *storage.Store) *ServersModel {
+func NewServersModelForSFTP(store *storage.Store, settingsStore *storage.SettingsStore, masterPassword string) *ServersModel {
 	return &ServersModel{
-		store:    store,
-		servers:  store.List(),
-		cursor:   0,
-		sftpMode: true,
+		store:          store,
+		settingsStore:  settingsStore,
+		masterPassword: masterPassword,
+		servers:        store.List(),
+		cursor:         0,
+		sftpMode:       true,
 	}
 }
 
@@ -126,12 +134,32 @@ func (m *ServersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor >= len(m.servers) && m.cursor > 0 {
 					m.cursor--
 				}
+				// Trigger auto-backup
+				return m, RunAutoBackup(m.settingsStore, m.masterPassword, "deleted")
 			}
 		}
+
+	case AutoBackupMsg:
+		if msg.Err != nil {
+			m.statusMsg = fmt.Sprintf("Auto-backup failed: %v", msg.Err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Server %s & Auto-backup successful!", msg.Action)
+			// Clear status after 3 seconds
+			return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+				return statusClearMsg{}
+			})
+		}
+		return m, nil
+
+	case statusClearMsg:
+		m.statusMsg = ""
+		return m, nil
 	}
 
 	return m, nil
 }
+
+type statusClearMsg struct{}
 
 func (m *ServersModel) View() string {
 	var b strings.Builder
@@ -173,6 +201,11 @@ func (m *ServersModel) View() string {
 	if m.err != nil {
 		b.WriteString("\n\n")
 		b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
+	}
+
+	if m.statusMsg != "" {
+		b.WriteString("\n\n")
+		b.WriteString(successStyle.Render(m.statusMsg))
 	}
 
 	return boxStyle.Render(b.String())

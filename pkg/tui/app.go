@@ -148,7 +148,7 @@ func (m AppModel) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case MenuServers:
 		m.state = StateServers
-		serversModel := NewServersModel(m.store)
+		serversModel := NewServersModel(m.store, m.settingsStore, m.masterPasswordCache)
 		m.serversModel = serversModel
 		m.menuModel.selected = MenuNone
 		return m, m.serversModel.Init()
@@ -156,7 +156,7 @@ func (m AppModel) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case MenuSFTP:
 		// Show servers list in SFTP mode
 		m.state = StateServers
-		serversModel := NewServersModelForSFTP(m.store)
+		serversModel := NewServersModelForSFTP(m.store, m.settingsStore, m.masterPasswordCache)
 		m.serversModel = serversModel
 		m.menuModel.selected = MenuNone
 		return m, m.serversModel.Init()
@@ -248,16 +248,19 @@ func (m AppModel) updateServerEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Return to servers list
 			m.state = StateServers
 			// Reload servers list
-			m.serversModel = NewServersModel(m.store)
+			m.serversModel = NewServersModel(m.store, m.settingsStore, m.masterPasswordCache)
 			return m, m.serversModel.Init()
 		}
-		// Check if saved
-		if m.serverEditModel.saved {
-			// Auto-return to servers list after save
-			m.state = StateServers
-			m.serversModel = NewServersModel(m.store)
-			return m, m.serversModel.Init()
-		}
+
+	case ServerSavedMsg:
+		// Auto-return to servers list after save
+		m.state = StateServers
+		m.serversModel = NewServersModel(m.store, m.settingsStore, m.masterPasswordCache)
+
+		// Trigger auto backup
+		backupCmd := RunAutoBackup(m.settingsStore, m.masterPasswordCache, "saved")
+
+		return m, tea.Batch(m.serversModel.Init(), backupCmd)
 	}
 
 	var cmd tea.Cmd
