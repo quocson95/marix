@@ -66,7 +66,11 @@ jobs:
         if: matrix.goos == 'linux'
         run: |
           cd build
-          zip ${{ matrix.artifact_name }} ${{ matrix.output_bin }}
+          cp ../scripts/linux/install.sh .
+          cp ../marix.desktop .
+          cp ../icon.svg .
+          chmod +x install.sh
+          zip ${{ matrix.artifact_name }} ${{ matrix.output_bin }} install.sh marix.desktop icon.svg
           cd ..
 
       # --- macOS DMG ---
@@ -77,6 +81,8 @@ jobs:
           
           mkdir -p dist
           cp build/marix dist/
+          cp scripts/macos/launcher.sh dist/Marix.command
+          chmod +x dist/Marix.command
           
           create-dmg \
             --volname "Marix Installer" \
@@ -85,6 +91,7 @@ jobs:
             --window-size 800 400 \
             --icon-size 100 \
             --icon "marix" 200 190 \
+            --icon "Marix.command" 400 190 \
             --hide-extension "marix" \
             --app-drop-link 600 185 \
             "build/${{ matrix.artifact_name }}" \
@@ -95,7 +102,8 @@ jobs:
         if: matrix.goos == 'windows'
         run: |
           cd build
-          7z a -tzip ${{ matrix.artifact_name }} ${{ matrix.output_bin }}
+          cp ../scripts/windows/start.bat .
+          7z a -tzip ${{ matrix.artifact_name }} ${{ matrix.output_bin }} start.bat
           cd ..
 
       - name: Upload Artifact
