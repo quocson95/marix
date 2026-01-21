@@ -11,14 +11,16 @@ import (
 
 // PasswordPromptModel is a reusable password input component
 type PasswordPromptModel struct {
-	input       textinput.Model
-	title       string
-	description string
-	submitted   bool
-	cancelled   bool
-	password    string
-	width       int
-	height      int
+	input        textinput.Model
+	title        string
+	description  string
+	originalDesc string // Store original description to restore after error
+	// submitted    bool
+	cancelled bool
+	password  string
+	width     int
+	height    int
+	isError   bool // Track if currently showing an error
 }
 
 // PasswordSubmittedMsg is sent when password is submitted
@@ -39,9 +41,10 @@ func NewPasswordPromptModel(title, description string) *PasswordPromptModel {
 	input.Focus()
 
 	return &PasswordPromptModel{
-		input:       input,
-		title:       title,
-		description: description,
+		input:        input,
+		title:        title,
+		description:  description,
+		originalDesc: description,
 	}
 }
 
@@ -59,10 +62,20 @@ func (m *PasswordPromptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Check for auto-clear on new input if in error state
+		if m.isError {
+			switch msg.Type {
+			case tea.KeyRunes: // Normal characters
+				m.input.SetValue("")
+				m.isError = false
+				m.description = m.originalDesc
+			}
+		}
+
 		switch msg.String() {
 		case "enter":
 			m.password = m.input.Value()
-			m.submitted = true
+			// m.submitted = true
 			return m, func() tea.Msg {
 				return PasswordSubmittedMsg{
 					Password:  m.password,
@@ -98,8 +111,11 @@ func (m *PasswordPromptModel) View() string {
 
 	// Description
 	if m.description != "" {
-		descStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("240"))
+		descColor := "240"
+		if m.isError {
+			descColor = "9" // Red for error
+		}
+		descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(descColor))
 		b.WriteString(descStyle.Render(m.description))
 		b.WriteString("\n\n")
 	}
@@ -125,6 +141,9 @@ func (m *PasswordPromptModel) View() string {
 
 func (m *PasswordPromptModel) SetError(err error) {
 	if err != nil {
+		m.isError = true
 		m.description = fmt.Sprintf("❌ %v", err)
+		// Reset submitted state to allow retry
+		// m.submitted = false
 	}
 }
