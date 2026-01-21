@@ -105,6 +105,40 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+
+	case RestoreMsg:
+		// Handle global restore event (restart app)
+		if msg.err == nil {
+			// Reload storage
+			homeDir, err := os.UserHomeDir()
+			if err == nil {
+				dataDir := filepath.Join(homeDir, ".marix")
+				newStore, err := storage.NewStore(dataDir)
+				if err == nil {
+					m.store = newStore
+				}
+				newSettingsStore, err := storage.NewSettingsStore(dataDir)
+				if err == nil {
+					m.settingsStore = newSettingsStore
+					m.masterPasswordCache = "" // Clear cache
+				}
+			}
+
+			// Reset state
+			settings := m.settingsStore.Get()
+			if settings.MasterPasswordHash != "" {
+				m.state = StatePasswordPrompt
+				m.passwordPrompt = NewPasswordPromptModel(
+					"🔐 Master Password Required",
+					"App restored. Please enter your master password:",
+				)
+				return m, m.passwordPrompt.Init()
+			} else {
+				m.state = StateMenu
+				m.menuModel.selected = MenuNone
+				return m, nil
+			}
+		}
 	}
 
 	// Route to appropriate screen

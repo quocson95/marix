@@ -12,20 +12,23 @@ import (
 
 // BackupModel manages backup and restore operations
 type BackupModel struct {
-	settingsStore       *storage.SettingsStore
-	inputs              []textinput.Model
-	cursor              int
-	focused             int
-	width               int
-	height              int
-	s3Host              string
-	s3AccessKey         string
-	s3SecretKey         string
-	dataDir             string
-	s3BackupInProgress  bool
-	s3RestoreInProgress bool
-	statusMsg           string
-	err                 error
+	settingsStore         *storage.SettingsStore
+	inputs                []textinput.Model
+	cursor                int
+	focused               int
+	width                 int
+	height                int
+	s3Host                string
+	s3AccessKey           string
+	s3SecretKey           string
+	dataDir               string
+	s3BackupInProgress    bool
+	s3RestoreInProgress   bool
+	statusMsg             string
+	err                   error
+	passwordPrompt        *PasswordPromptModel
+	showingPasswordPrompt bool
+	waitingForRestart     bool
 }
 
 const (
@@ -66,7 +69,7 @@ func NewBackupModel(settingsStore *storage.SettingsStore) *BackupModel {
 	inputs[backupS3SecretKey].SetValue(settings.S3SecretKey)
 
 	inputs[backupPassword] = textinput.New()
-	inputs[backupPassword].Placeholder = "Encryption password"
+	inputs[backupPassword].Placeholder = "Encryption password (for backup)"
 	inputs[backupPassword].CharLimit = 128
 	inputs[backupPassword].Width = 40
 	inputs[backupPassword].Prompt = "Backup Password: "
@@ -95,85 +98,121 @@ func (m *BackupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// Handle Tab navigation
-		if msg.String() == "tab" || msg.String() == "shift+tab" {
-			if m.focused >= 0 {
-				m.inputs[m.focused].Blur()
-				m.focused = -1
+		// Handle Password Prompt
+		if m.showingPasswordPrompt {
+			// Pass keys to prompt
+			// We don't handle global keys here to let prompt handle them
+		} else if m.waitingForRestart {
+			// If waiting for restart, only accept Enter
+			if msg.String() == "enter" {
+				// Bubble up success message to AppModel
+				return m, func() tea.Msg {
+					return RestoreMsg{err: nil}
+				}
 			}
-
-			direction := 1
-			if msg.String() == "shift+tab" {
-				direction = -1
-			}
-
-			m.cursor += direction
-			maxIndex := len(m.inputs) + 1 // inputs + backup + restore
-
-			if m.cursor > maxIndex {
-				m.cursor = 0
-			} else if m.cursor < 0 {
-				m.cursor = maxIndex
-			}
-
-			if m.cursor < len(m.inputs) {
-				m.focused = m.cursor
-				m.inputs[m.focused].Focus()
-			}
-
 			return m, nil
-		}
+		} else {
+			// Handle Tab navigation
+			if msg.String() == "tab" || msg.String() == "shift+tab" {
+				if m.focused >= 0 {
+					m.inputs[m.focused].Blur()
+					m.focused = -1
+				}
 
-		// If input focused, handle input
-		if m.focused >= 0 && m.focused < len(m.inputs) {
-			switch msg.String() {
-			case "enter", "esc":
-				m.inputs[m.focused].Blur()
-				m.focused = -1
+				direction := 1
+				if msg.String() == "shift+tab" {
+					direction = -1
+				}
+
+				m.cursor += direction
+				maxIndex := len(m.inputs) + 2 // inputs + auto + backup + restore
+
+				if m.cursor > maxIndex {
+					m.cursor = 0
+				} else if m.cursor < 0 {
+					m.cursor = maxIndex
+				}
+
+				if m.cursor < len(m.inputs) {
+					m.focused = m.cursor
+					m.inputs[m.focused].Focus()
+				}
+
 				return m, nil
-			default:
-				var cmd tea.Cmd
-				m.inputs[m.focused], cmd = m.inputs[m.focused].Update(msg)
-				return m, cmd
+			}
+
+			// If input focused, handle input
+			if m.focused >= 0 && m.focused < len(m.inputs) {
+				switch msg.String() {
+				case "enter", "esc":
+					m.inputs[m.focused].Blur()
+					m.focused = -1
+					return m, nil
+				default:
+					var cmd tea.Cmd
+					m.inputs[m.focused], cmd = m.inputs[m.focused].Update(msg)
+					return m, cmd
+				}
+			}
+
+			// Otherwise, handle navigation
+			switch msg.String() {
+			case "up", "k":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+
+			case "down", "j":
+				maxCursor := len(m.inputs) + 2
+				if m.cursor < maxCursor {
+					m.cursor++
+				}
+
+			case "enter", " ":
+				if m.cursor < len(m.inputs) {
+					m.focused = m.cursor
+					m.inputs[m.focused].Focus()
+				} else if m.cursor == len(m.inputs) {
+					// Toggle Auto Backup
+					settings := m.settingsStore.Get()
+					m.settingsStore.SetAutoBackup(!settings.AutoBackup)
+				} else if m.cursor == len(m.inputs)+1 {
+					// Backup
+					return m, m.performBackup()
+				} else if m.cursor == len(m.inputs)+2 {
+					// Restore - Trigger Prompt
+					m.showingPasswordPrompt = true
+					m.passwordPrompt = NewPasswordPromptModel(
+						"🔓 Decrypt Backup",
+						"Enter the password used to encrypt this backup:",
+					)
+					return m, m.passwordPrompt.Init()
+				}
+
+			case "b":
+				// Quick backup
+				return m, m.performBackup()
+
+			case "r":
+				// Quick restore - Trigger Prompt
+				m.showingPasswordPrompt = true
+				m.passwordPrompt = NewPasswordPromptModel(
+					"🔓 Decrypt Backup",
+					"Enter the password used to encrypt this backup:",
+				)
+				return m, m.passwordPrompt.Init()
 			}
 		}
 
-		// Otherwise, handle navigation
-		switch msg.String() {
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
+	case PasswordSubmittedMsg:
+		if m.showingPasswordPrompt {
+			if msg.Cancelled {
+				m.showingPasswordPrompt = false
+				m.passwordPrompt = nil
+				return m, nil
 			}
-
-		case "down", "j":
-			maxCursor := len(m.inputs) + 1
-			if m.cursor < maxCursor {
-				m.cursor++
-			}
-
-		case "enter", " ":
-			if m.cursor < len(m.inputs) {
-				m.focused = m.cursor
-				m.inputs[m.focused].Focus()
-			} else if m.cursor == len(m.inputs) {
-				// Toggle Auto Backup
-				settings := m.settingsStore.Get()
-				m.settingsStore.SetAutoBackup(!settings.AutoBackup)
-			} else if m.cursor == len(m.inputs)+1 {
-				// Backup
-				return m, m.performBackup()
-			} else if m.cursor == len(m.inputs)+2 {
-				// Restore
-				return m, m.performRestore()
-			}
-
-		case "b":
-			// Quick backup
-			return m, m.performBackup()
-
-		case "r":
-			// Quick restore
-			return m, m.performRestore()
+			m.showingPasswordPrompt = false
+			return m, m.performRestore(msg.Password)
 		}
 
 	case BackupMsg:
@@ -192,11 +231,25 @@ func (m *BackupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.err = msg.err
 			m.statusMsg = ""
-		} else {
-			m.err = nil
-			m.statusMsg = "✓ Restore successful! Restart app. ♻️"
+			return m, nil
 		}
+		// Success case handled by RestoreSuccessMsg now
 		return m, nil
+
+	case RestoreSuccessMsg:
+		m.s3RestoreInProgress = false
+		m.err = nil
+		m.statusMsg = "✓ Restore successful! Press Enter to restart."
+		m.waitingForRestart = true
+		return m, nil
+	}
+
+	// Update password prompt if showing
+	if m.showingPasswordPrompt && m.passwordPrompt != nil {
+		var cmd tea.Cmd
+		updatedModel, cmd := m.passwordPrompt.Update(msg)
+		m.passwordPrompt = updatedModel.(*PasswordPromptModel)
+		return m, cmd
 	}
 
 	return m, nil
@@ -207,6 +260,9 @@ type AutoBackupMsg struct {
 	Err    error
 	Action string
 }
+
+// RestoreSuccessMsg is sent internally when restore is done but needs confirmation
+type RestoreSuccessMsg struct{}
 
 // AutoBackupCmd creates a command to perform an auto-backup if enabled
 func AutoBackupCmd(settingsStore *storage.SettingsStore) tea.Cmd {
@@ -299,19 +355,20 @@ func (m *BackupModel) performBackup() tea.Cmd {
 	}
 }
 
-func (m *BackupModel) performRestore() tea.Cmd {
+func (m *BackupModel) performRestore(password string) tea.Cmd {
 	return func() tea.Msg {
 		host := m.inputs[backupS3Host].Value()
 		access := m.inputs[backupS3AccessKey].Value()
 		secret := m.inputs[backupS3SecretKey].Value()
-		password := m.inputs[backupPassword].Value()
+		// password now comes from argument, not input
+		// password := m.inputs[backupPassword].Value()
 
 		if host == "" || access == "" || secret == "" {
 			return RestoreMsg{err: fmt.Errorf("missing S3 configuration")}
 		}
 
 		if password == "" {
-			return RestoreMsg{err: fmt.Errorf("backup password is required")}
+			return RestoreMsg{err: fmt.Errorf("decryption password is required")}
 		}
 
 		// Save settings on restore too
@@ -334,11 +391,15 @@ func (m *BackupModel) performRestore() tea.Cmd {
 			return RestoreMsg{err: err}
 		}
 
-		return RestoreMsg{nil}
+		return RestoreSuccessMsg{}
 	}
 }
 
 func (m *BackupModel) View() string {
+	if m.showingPasswordPrompt && m.passwordPrompt != nil {
+		return m.passwordPrompt.View()
+	}
+
 	var s string
 
 	s += titleStyle.Render("☁️ Backup & Restore") + "\n\n"
