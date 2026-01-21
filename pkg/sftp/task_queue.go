@@ -171,6 +171,14 @@ func (q *TaskQueue) dispatcher() {
 }
 
 func (q *TaskQueue) processTask(task *Task) {
+	if q.client == nil {
+		log.Printf("[ERROR] TaskQueue client is nil, skipping task processing (likely test environment)")
+		task.State = TaskFailed
+		task.err = fmt.Errorf("client not initialized")
+		q.notify(task)
+		return
+	}
+
 	if task.ctx.Err() != nil {
 		task.State = TaskCancelled
 		q.notify(task)
