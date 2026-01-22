@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -14,14 +15,14 @@ func main() {
 	// Set up logging to file
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Printf("Error getting home directory: %v\n", err)
+		slog.Error("Error getting home directory", "error", err)
 		os.Exit(1)
 	}
 
 	dataDir := filepath.Join(homeDir, ".marix")
 	// Ensure data directory exists
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		fmt.Printf("Error creating data directory: %v\n", err)
+		slog.Error("Error creating data directory", "error", err)
 		os.Exit(1)
 	}
 
@@ -32,7 +33,7 @@ func main() {
 		0600,
 	)
 	if err != nil {
-		fmt.Printf("Error opening log file: %v\n", err)
+		slog.Error("Error opening log file", "error", err)
 		os.Exit(1)
 	}
 	defer logFile.Close()
@@ -41,11 +42,16 @@ func main() {
 	log.SetOutput(logFile)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
+	// Configure slog to write to file
+	handler := slog.NewTextHandler(logFile, nil)
+	slog.SetDefault(slog.New(handler))
+
 	// Create the application model
 	appModel, err := tui.NewAppModel()
 	if err != nil {
-		log.Printf("Error initializing application: %v", err)
-		fmt.Printf("Error initializing application: %v\n", err)
+		slog.Error("Error initializing application", "error", err)
+		// Print to stderr as well since we are exiting
+		fmt.Fprintf(os.Stderr, "Error initializing application: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -57,8 +63,9 @@ func main() {
 
 	// Run the program
 	if _, err := p.Run(); err != nil {
-		log.Printf("Error running program: %v", err)
-		fmt.Printf("Error: %v\n", err)
+		slog.Error("Error running program", "error", err)
+		// Print to stderr as well since we are exiting
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }

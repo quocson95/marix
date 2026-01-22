@@ -96,8 +96,24 @@ func (m *ServersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return ServerSFTPMsg{server: server}
 					}
 				} else {
+					// Prepare private key (decrypt if needed)
+					privateKey := server.PrivateKey
+					if len(server.PrivateKeyEncrypted) > 0 {
+						if m.masterPassword != "" {
+							decrypted, err := storage.DecryptPrivateKey(server.PrivateKeyEncrypted, server.KeyEncryptionSalt, m.masterPassword)
+							if err != nil {
+								m.err = fmt.Errorf("failed to decrypt key: %w", err)
+								return m, nil
+							}
+							privateKey = string(decrypted)
+						} else {
+							m.err = fmt.Errorf("master password required to decrypt key")
+							return m, nil
+						}
+					}
+
 					// Always launch in external terminal for SSH
-					err := LaunchExternalTerminal(server.Host, server.Port, server.Username, server.Password, server.PrivateKey)
+					err := LaunchExternalTerminal(server.Host, server.Port, server.Username, server.Password, privateKey)
 					if err != nil {
 						m.err = fmt.Errorf("failed to launch terminal: %w", err)
 					}
