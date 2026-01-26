@@ -63,6 +63,7 @@ jobs:
             go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
             export PATH=$PATH:$(go env GOPATH)/bin
             goversioninfo
+            mv resource.syso cmd/marix/
           fi
           go build -ldflags="-s -w" -o build/${{ matrix.output_bin }} ./cmd/marix
 
