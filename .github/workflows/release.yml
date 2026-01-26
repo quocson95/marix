@@ -59,6 +59,8 @@ jobs:
           CGO_ENABLED: 0
         run: |
           mkdir -p build
+          go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+          goversioninfo
           go build -ldflags="-s -w" -o build/${{ matrix.output_bin }} ./cmd/marix
 
       # --- Linux Compression ---
